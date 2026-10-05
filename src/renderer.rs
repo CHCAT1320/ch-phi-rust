@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use bytemuck::{Pod, Zeroable};
 use winit::window::Window;
 
@@ -8,10 +10,17 @@ use crate::line::{self, Line, Vertex, SHADER, VERTICES_PER_LINE};
 
 const INITIAL_VERTEX_CAPACITY: usize = VERTICES_PER_LINE as usize;
 const INITIAL_BLOCK_CAPACITY: usize = 6;
+/// 音符顶点初始容量（每音符 2 个三角形 = 6 顶点）。
+const INITIAL_NOTE_CAPACITY: usize = 6;
 
-const BLOCK_MASK_PATH: &str = "assets/block/Block.png";
-const BLOCK_DISPLACE_PATH: &str = "assets/block/BlockNoise1.png";
-const BLOCK_SPARK_PATH: &str = "assets/block/PointNoise.png";
+/// 文本/UI 图集尺寸（RGBA8，字体字形与 UI 图片共用）。
+const TEXT_ATLAS_SIZE: u32 = 1024;
+/// 字体资源键（内嵌 `assets/ui/Phigros.ttf`）。
+const FONT_KEY: &str = "ui/Phigros.ttf";
+
+const BLOCK_MASK_KEY: &str = "block/Block.png";
+const BLOCK_DISPLACE_KEY: &str = "block/BlockNoise1.png";
+const BLOCK_SPARK_KEY: &str = "block/PointNoise.png";
 
 /// 块遮罩 RT 相对屏幕的降采样（文档为 8，但边界台阶过粗 → 提高精度）。
 const MASK_DOWNSCALE: u32 = 2;
@@ -43,6 +52,58 @@ pub enum Fit {
     Contain,
 }
 
+/// 2D 仿射矩阵（canvas 的 6 参数形式）：
+/// `x' = a·x + c·y + e`，`y' = b·x + d·y + f`。
+///
+/// 作为 [`Renderer`] 的当前变换（CTM），语义与 HTML Canvas 2D 的
+/// `ctx.translate` / `rotate` / `scale` 一致：变换按调用顺序**后乘**，
+/// 且作用于之后所有 `draw_line` / `draw_block` 的用户坐标。
+#[derive(Clone, Copy)]
+struct Affine2 {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Affine2 {
+    /// 恒等变换。
+    const IDENTITY: Self = Self { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+
+    /// `self * other`：先应用 `other`，再应用 `self`（canvas 后乘语义）。
+    fn mul(self, o: Self) -> Self {
+        Self {
+            a: self.a * o.a + self.c * o.b,
+            b: self.b * o.a + self.d * o.b,
+            c: self.a * o.c + self.c * o.d,
+            d: self.b * o.c + self.d * o.d,
+            e: self.a * o.e + self.c * o.f + self.e,
+            f: self.b * o.e + self.d * o.f + self.f,
+        }
+    }
+
+    fn translate(x: f32, y: f32) -> Self {
+        Self { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }
+    }
+
+    /// 旋转，角度单位为度，逆时针为正（与 `draw_line` 的角度一致）。
+    fn rotate(deg: f32) -> Self {
+        let (sin, cos) = deg.to_radians().sin_cos();
+        Self { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 }
+    }
+
+    fn scale(sx: f32, sy: f32) -> Self {
+        Self { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+    }
+
+    /// 变换一个点（含平移分量）。
+    fn apply(self, p: [f32; 2]) -> [f32; 2] {
+        [self.a * p[0] + self.c * p[1] + self.e, self.b * p[0] + self.d * p[1] + self.f]
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct BlockVertex {
@@ -58,6 +119,139 @@ impl BlockVertex {
         wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &Self::ATTRIBS }
     }
 }
+
+/// 一条待绘制线段 + 绘制时所处的坐标系变换（canvas 语义：变换在 `draw_line` 时捕获）。
+#[derive(Clone, Copy)]
+struct LineDraw {
+    line: Line,
+    transform: Affine2,
+}
+
+/// 音符顶点：NDC 位置 + UV + 颜色。
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct NoteVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    color: [f32; 4],
+}
+
+impl NoteVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &Self::ATTRIBS }
+    }
+}
+
+/// 音符贴图种类（含高亮 HL 版本）。索引与 [`NOTE_TEXTURE_PATHS`] 一一对应。
+#[derive(Clone, Copy)]
+pub enum NoteTexture {
+    /// Tap（普通）。
+    Tap,
+    /// Tap（高亮）。
+    TapHl,
+    /// Drag（普通）。
+    Drag,
+    /// Drag（高亮）。
+    DragHl,
+    /// Flick（普通）。
+    Flick,
+    /// Flick（高亮）。
+    FlickHl,
+    /// Hold 主体（普通）。
+    HoldBody,
+    /// Hold 主体（高亮）。
+    HoldBodyHl,
+    /// Hold 头（普通）。
+    HoldHead,
+    /// Hold 头（高亮）。
+    HoldHeadHl,
+    /// Hold 尾。
+    HoldEnd,
+}
+
+impl NoteTexture {
+    fn index(self) -> usize {
+        match self {
+            NoteTexture::Tap => 0,
+            NoteTexture::TapHl => 1,
+            NoteTexture::Drag => 2,
+            NoteTexture::DragHl => 3,
+            NoteTexture::Flick => 4,
+            NoteTexture::FlickHl => 5,
+            NoteTexture::HoldBody => 6,
+            NoteTexture::HoldBodyHl => 7,
+            NoteTexture::HoldHead => 8,
+            NoteTexture::HoldHeadHl => 9,
+            NoteTexture::HoldEnd => 10,
+        }
+    }
+}
+
+/// 音符贴图数量（索引与 [`NoteTexture`] 对应）。
+const NOTE_TEXTURE_COUNT: usize = 11;
+
+/// 音符贴图文件（`HL` 为高亮版本）；键为相对 `assets/` 的路径。
+const NOTE_TEXTURE_PATHS: [&str; NOTE_TEXTURE_COUNT] = [
+    "notes/Tap2.png",
+    "notes/Tap2HL.png",
+    "notes/Drag2.png",
+    "notes/DragHL.png",
+    "notes/Flick2.png",
+    "notes/Flick2HL.png",
+    "notes/Hold.png",
+    "notes/HoldHL.png",
+    "notes/HoldHead.png",
+    "notes/HoldHeadHL.png",
+    "notes/HoldEnd.png",
+];
+
+/// 一个待绘制音符：`center` 为其所在判定线**局部坐标系**中的中心，`angle` 为局部角度（弧度），
+/// 宽高为设计像素；`texture` 为 [`NoteTexture`] 索引。
+#[derive(Clone, Copy)]
+struct NoteSprite {
+    center: [f32; 2],
+    width: f32,
+    height: f32,
+    angle: f32,
+    texture: usize,
+    color: [f32; 4],
+    /// 横向 UV 范围（裁剪贴图左右透明留白）。
+    uv_x: [f32; 2],
+    transform: Affine2,
+    /// 绘制层：`0` = Hold（位于所有note最下面）、`1` = 普通note、`2` = 打击特效。
+    layer: u8,
+}
+
+/// 音符贴图着色器：直接采样贴图并乘以顶点色（顶点色含全局透明度）。
+const NOTE_SHADER: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+}
+
+@vertex
+fn vs_main(
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+) -> VsOut {
+    var o: VsOut;
+    o.pos = vec4<f32>(position, 0.0, 1.0);
+    o.uv = uv;
+    o.color = color;
+    return o;
+}
+
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv) * in.color;
+}
+"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -417,6 +611,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
 
 // ---- 主结构 ----
 
+/// 一个已光栅化的字形（存于文本图集）。
+#[derive(Clone, Copy)]
+struct Glyph {
+    /// 图集 UV：`[u0, v0, u1, v1]`。
+    uv: [f32; 4],
+    /// 位图尺寸（像素）。
+    size: [f32; 2],
+    /// 相对笔位置的左偏移（`px_bounds.min.x`）。
+    left: f32,
+    /// 基线上方到字形顶部的距离（像素，正值）。
+    top: f32,
+    /// 水平前进量。
+    advance: f32,
+}
+
+/// 打包进文本图集的一张 UI 图片。
+#[derive(Clone, Copy)]
+struct UiImage {
+    uv: [f32; 4],
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -485,11 +700,48 @@ pub struct Renderer {
     fit: Fit,
     origin: [f32; 2],
     y_up: bool,
+    /// 当前用户空间变换（canvas 风格），由 `translate` / `rotate` / `scale` 修改。
+    ctm: Affine2,
+    /// `save()` 压入的变换栈。
+    #[allow(dead_code)]
+    transform_stack: Vec<Affine2>,
     fps: Fps,
     vsync: bool,
-    lines: Vec<Line>,
+    lines: Vec<LineDraw>,
     vertices: Vec<Vertex>,
     block_vertices: Vec<BlockVertex>,
+
+    note_pipeline: wgpu::RenderPipeline,
+    note_bind_groups: Vec<wgpu::BindGroup>,
+    note_tex_size: [[f32; 2]; NOTE_TEXTURE_COUNT],
+    note_tex_alpha: [f32; NOTE_TEXTURE_COUNT],
+    note_tex_blue: [f32; NOTE_TEXTURE_COUNT],
+    note_buffer: wgpu::Buffer,
+    note_capacity: usize,
+    note_vertices: Vec<NoteVertex>,
+    note_sprites: Vec<NoteSprite>,
+    /// 打击特效帧数量（`assets/hit/img-*.png`）。
+    hit_frame_count: usize,
+
+    /// 字体（内嵌 `assets/ui/Phigros.ttf`）。
+    font: FontRef<'static>,
+    /// 字形缓存：键 `(字符码点, 像素高度)`。
+    glyphs: HashMap<(u32, u32), Glyph>,
+    /// 打包进文本图集的 UI 图片（键为资源键）。
+    ui_images: HashMap<String, UiImage>,
+    /// 文本图集 CPU 数据（RGBA8）与打包游标。
+    atlas_data: Vec<u8>,
+    atlas_x: u32,
+    atlas_y: u32,
+    atlas_row_h: u32,
+    atlas_dirty: bool,
+    /// 文本图集纹理（首帧及其后有新字形时整张上传）。
+    text_atlas_tex: wgpu::Texture,
+    text_bg: wgpu::BindGroup,
+    text_pipeline: wgpu::RenderPipeline,
+    text_buffer: wgpu::Buffer,
+    text_capacity: usize,
+    text_vertices: Vec<NoteVertex>,
 }
 
 impl Renderer {
@@ -513,12 +765,12 @@ impl Renderer {
         let vertex_buffer = create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY);
         let block_vertex_buffer = create_block_vertex_buffer(&device, INITIAL_BLOCK_CAPACITY);
 
-        let mask_tex = load_texture(&device, &queue, BLOCK_MASK_PATH, false);
-        let disp_tex = load_texture(&device, &queue, BLOCK_DISPLACE_PATH, false);
-        let spark_tex = load_texture(&device, &queue, BLOCK_SPARK_PATH, false);
-        // 背景图（`IllustrationBlur.0.png`）：先画进 scene_full，供 active 的 `_SceneColor` 采样。
+        let mask_tex = load_texture(&device, &queue, BLOCK_MASK_KEY, false);
+        let disp_tex = load_texture(&device, &queue, BLOCK_DISPLACE_KEY, false);
+        let spark_tex = load_texture(&device, &queue, BLOCK_SPARK_KEY, false);
+        // 背景图（`IllustrationBlur.0.png`）：随谱面一起提供，运行时从磁盘读取。
         let bg_view = match &bg_path {
-            Some(p) if std::path::Path::new(p).exists() => load_texture(&device, &queue, p, false).view,
+            Some(p) if std::path::Path::new(p).exists() => load_texture_file(&device, &queue, p, false).view,
             _ => solid_texture(&device, &queue, [0, 0, 0, 255]),
         };
         let bg_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -540,6 +792,79 @@ impl Renderer {
             ..Default::default()
         });
         let block_uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("block uniform"), size: std::mem::size_of::<BlockUniform>() as wgpu::BufferAddress, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+        // 音符贴图（普通 + HL 高亮）、采样器、绑定组与管线。
+        let note_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("note sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let note_bgl = create_note_bgl(&device);
+        let mut note_tex_size = [[1.0f32, 1.0f32]; NOTE_TEXTURE_COUNT];
+        let mut note_tex_alpha = [1.0f32; NOTE_TEXTURE_COUNT];
+        let mut note_tex_blue = [1.0f32; NOTE_TEXTURE_COUNT];
+        let mut note_bind_groups = Vec::with_capacity(NOTE_TEXTURE_COUNT);
+        for (i, path) in NOTE_TEXTURE_PATHS.iter().enumerate() {
+            let t = load_texture(&device, &queue, path, false);
+            note_tex_size[i] = [t.size[0] as f32, t.size[1] as f32];
+            note_tex_alpha[i] = t.alpha_width;
+            note_tex_blue[i] = t.blue_width;
+            note_bind_groups.push(bg_note(&device, &note_bgl, &t.view, &note_sampler));
+        }
+        // 打击特效帧（内嵌 `hit/img-N.png`），索引紧跟在音符贴图之后；统一染成金色。
+        let mut hit_frame_count = 0usize;
+        for i in 1..=64 {
+            let key = format!("hit/img-{i}.png");
+            if crate::embedded::get(&key).is_none() { break; }
+            let t = load_texture_tinted(&device, &queue, &key, false, Some([255, 236, 160]));
+            note_bind_groups.push(bg_note(&device, &note_bgl, &t.view, &note_sampler));
+            hit_frame_count += 1;
+        }
+        // 打击特效的小方块：纯白贴图，绘制时用顶点色染成金色。
+        let spark_view = solid_texture(&device, &queue, [255, 255, 255, 255]);
+        note_bind_groups.push(bg_note(&device, &note_bgl, &spark_view, &note_sampler));
+        let note_pipeline = build_note_pipeline(&device, config.format, MSAA_SAMPLES, &note_bgl);
+        let note_buffer = create_note_vertex_buffer(&device, INITIAL_NOTE_CAPACITY);
+
+        // ---- 文本/UI 图集（字形与 UI 图片共用，绘制在最终合成之上）----
+        let font = FontRef::try_from_slice(crate::embedded::expect(FONT_KEY)).expect("解析字体失败");
+        let mut atlas_data = vec![0u8; (TEXT_ATLAS_SIZE as usize) * (TEXT_ATLAS_SIZE as usize) * 4];
+        let mut atlas_cursor = (0u32, 0u32, 0u32);
+        let mut ui_images: HashMap<String, UiImage> = HashMap::new();
+        for key in ["ui/pause.png", "ui/timerLine.png"] {
+            let img = image::load_from_memory(crate::embedded::expect(key)).expect("解码 UI 图片失败").to_rgba8();
+            let (iw, ih) = (img.width(), img.height());
+            let (ax, ay) = atlas_pack(&mut atlas_cursor, iw + 2, ih + 2);
+            atlas_blit(&mut atlas_data, ax + 1, ay + 1, &img);
+            ui_images.insert(
+                key.to_string(),
+                UiImage {
+                    uv: [
+                        (ax + 1) as f32 / TEXT_ATLAS_SIZE as f32,
+                        (ay + 1) as f32 / TEXT_ATLAS_SIZE as f32,
+                        (ax + 1 + iw) as f32 / TEXT_ATLAS_SIZE as f32,
+                        (ay + 1 + ih) as f32 / TEXT_ATLAS_SIZE as f32,
+                    ],
+                },
+            );
+        }
+        let text_atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("text atlas"),
+            size: wgpu::Extent3d { width: TEXT_ATLAS_SIZE, height: TEXT_ATLAS_SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        let text_atlas_view = text_atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let text_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("text sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let text_bg = bg_note(&device, &note_bgl, &text_atlas_view, &text_sampler);
+        let text_pipeline = build_note_pipeline(&device, config.format, 1, &note_bgl);
+        let text_buffer = create_note_vertex_buffer(&device, INITIAL_NOTE_CAPACITY);
 
         let all = wgpu::ColorWrites::ALL;
         // Unlit/BlockSprite 固定状态：Blend SrcAlpha, One（加性）
@@ -624,8 +949,11 @@ impl Renderer {
             block_vertex_buffer, block_capacity: INITIAL_BLOCK_CAPACITY, block_uniform, glow_configs, rt_sampler, disp_sampler, spark_sampler, effect_sampler,
             disp_view: disp_tex.view, spark_view: spark_tex.view,
             rt_normal, rt_subtract, rt_disabled_normal, rt_disabled_subtract, rt_ready_normal, rt_ready_subtract, rt_composed_enabled, rt_composed_disabled, rt_effect, ping_a, ping_b, rt_scene_full, rt_scene, mask_msaa, scene_full_msaa,
-            block_time: 0.0, size: surface_size, design, fit: Fit::default(), origin: [0.0, 0.0], y_up: false, fps: Fps::new(), vsync,
+            block_time: 0.0, size: surface_size, design, fit: Fit::default(), origin: [0.0, 0.0], y_up: false, ctm: Affine2::IDENTITY, transform_stack: Vec::new(), fps: Fps::new(), vsync,
             lines: Vec::new(), vertices: Vec::new(), block_vertices: Vec::new(),
+            note_pipeline, note_bind_groups, note_tex_size, note_tex_alpha, note_tex_blue, note_buffer, note_capacity: INITIAL_NOTE_CAPACITY, note_vertices: Vec::new(), note_sprites: Vec::new(), hit_frame_count,
+            font, glyphs: HashMap::new(), ui_images, atlas_data, atlas_x: atlas_cursor.0, atlas_y: atlas_cursor.1, atlas_row_h: atlas_cursor.2, atlas_dirty: true,
+            text_atlas_tex, text_bg, text_pipeline, text_buffer, text_capacity: INITIAL_NOTE_CAPACITY, text_vertices: Vec::new(),
         }
     }
 
@@ -637,23 +965,198 @@ impl Renderer {
     }
     pub fn fps(&self) -> f32 { self.fps.value() }
     pub fn set_coordinate_system(&mut self, origin: [f32; 2], y_up: bool) { self.origin = origin; self.y_up = y_up; }
+
+    /// 保存当前用户坐标系变换（对应 canvas `ctx.save()`）。
+    #[allow(dead_code)]
+    pub fn save(&mut self) { self.transform_stack.push(self.ctm); }
+    /// 恢复到最近一次 [`Self::save`] 的变换（对应 canvas `ctx.restore()`）。
+    #[allow(dead_code)]
+    pub fn restore(&mut self) { if let Some(m) = self.transform_stack.pop() { self.ctm = m; } }
+    /// 把用户坐标系变换重置为恒等。
+    #[allow(dead_code)]
+    pub fn reset_transform(&mut self) { self.ctm = Affine2::IDENTITY; }
+    /// 平移用户坐标系（对应 canvas `ctx.translate(x, y)`）。
+    #[allow(dead_code)]
+    pub fn translate(&mut self, x: f32, y: f32) { self.ctm = self.ctm.mul(Affine2::translate(x, y)); }
+    /// 旋转用户坐标系，角度单位为度、逆时针为正（对应 canvas `ctx.rotate`，但用度）。
+    #[allow(dead_code)]
+    pub fn rotate(&mut self, deg: f32) { self.ctm = self.ctm.mul(Affine2::rotate(deg)); }
+    /// 缩放用户坐标系（对应 canvas `ctx.scale(sx, sy)`）。
+    #[allow(dead_code)]
+    pub fn scale(&mut self, sx: f32, sy: f32) { self.ctm = self.ctm.mul(Affine2::scale(sx, sy)); }
+
     pub fn window_size(&self) -> [f32; 2] { self.size }
     pub fn set_viewport(&mut self, design: [f32; 2], fit: Fit) { self.design = design; self.fit = fit; }
     pub fn set_time(&mut self, time: f32) { self.block_time = time; }
 
     pub fn draw_line(&mut self, center: [f32; 2], length: f32, angle: f32, width: f32, color: [f32; 4]) {
-        self.lines.push(Line { center, length, angle: angle.to_radians(), width, color: [color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, color[3]] });
+        let line = Line { center, length, angle: angle.to_radians(), width, color: [color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, color[3]] };
+        self.lines.push(LineDraw { line, transform: self.ctm });
+    }
+
+    /// 绘制一个音符（tap/drag/flick）。`center`、`angle` 与当前用户坐标系一致，通常配合
+    /// `translate` / `rotate` 放到判定线局部坐标里使用；`width` 为设计像素宽度，高度按
+    /// `texture` 的贴图宽高比自动换算，`color` 的 alpha 用于整体淡入淡出。
+    pub fn draw_note(&mut self, center: [f32; 2], width: f32, angle: f32, texture: NoteTexture, color: [f32; 4]) {
+        self.draw_note_flip(center, width, angle, texture, color, false);
+    }
+
+    /// 同 [`Self::draw_note`]，但 `flip_v` 为真时上下翻转贴图（判定线下方的 Hold 使用）。
+    pub fn draw_note_flip(&mut self, center: [f32; 2], width: f32, angle: f32, texture: NoteTexture, color: [f32; 4], flip_v: bool) {
+        let tex = texture.index();
+        let size = self.note_tex_size[tex];
+        let height = width * size[1] / size[0] * if flip_v { -1.0 } else { 1.0 };
+        self.note_sprites.push(NoteSprite { center, width, height, angle: angle.to_radians(), texture: tex, color, uv_x: [0.0, 1.0], transform: self.ctm, layer: 1 });
+    }
+
+    /// 绘制指定宽高的音符四边形（Hold 主体用，高度随 Hold 长度变化）。`uv_x` 用于裁剪贴图左右留白。
+    pub fn draw_note_sized(&mut self, center: [f32; 2], width: f32, height: f32, angle: f32, texture: NoteTexture, color: [f32; 4], uv_x: [f32; 2]) {
+        self.note_sprites.push(NoteSprite { center, width, height, angle: angle.to_radians(), texture: texture.index(), color, uv_x, transform: self.ctm, layer: 0 });
+    }
+
+    /// 打击特效帧数量（`assets/hit/img-*.png`）。
+    pub fn hit_frame_count(&self) -> usize {
+        self.hit_frame_count
+    }
+
+    /// 绘制一帧打击特效（正方形、轴对齐，不随判定线旋转）。`frame` 会被裁剪到有效范围。
+    pub fn draw_hit(&mut self, center: [f32; 2], size: f32, frame: usize, color: [f32; 4]) {
+        if self.hit_frame_count == 0 { return; }
+        let frame = frame.min(self.hit_frame_count - 1);
+        self.note_sprites.push(NoteSprite { center, width: size, height: size, angle: 0.0, texture: NOTE_TEXTURE_COUNT + frame, color, uv_x: [0.0, 1.0], transform: self.ctm, layer: 2 });
+    }
+
+    /// 绘制打击特效的金色小方块（轴对齐正方形，用顶点色染色）。
+    pub fn draw_spark(&mut self, center: [f32; 2], size: f32, color: [f32; 4]) {
+        let texture = NOTE_TEXTURE_COUNT + self.hit_frame_count;
+        self.note_sprites.push(NoteSprite { center, width: size, height: size, angle: 0.0, texture, color, uv_x: [0.0, 1.0], transform: self.ctm, layer: 2 });
+    }
+
+    /// 在文本图集里分配一块区域。
+    fn atlas_alloc(&mut self, w: u32, h: u32) -> (u32, u32) {
+        let mut c = (self.atlas_x, self.atlas_y, self.atlas_row_h);
+        let p = atlas_pack(&mut c, w, h);
+        self.atlas_x = c.0; self.atlas_y = c.1; self.atlas_row_h = c.2;
+        p
+    }
+
+    /// 取得（必要时光栅化并打包）指定像素高度的字符字形。
+    fn glyph_for(&mut self, ch: char, px: u32) -> Glyph {
+        let key = (ch as u32, px);
+        if let Some(g) = self.glyphs.get(&key) { return *g; }
+        let scale = PxScale::from(px as f32);
+        let advance = self.font.as_scaled(scale).h_advance(self.font.glyph_id(ch));
+        let glyph = if let Some(outline) = self.font.outline_glyph(self.font.glyph_id(ch).with_scale_and_position(scale, ab_glyph::point(0.0, 0.0))) {
+            let b = outline.px_bounds();
+            let w = (b.width().ceil() as u32).max(1);
+            let h = (b.height().ceil() as u32).max(1);
+            let mut cov = vec![0u8; (w * h) as usize];
+            outline.draw(|x, y, c| {
+                if x < w && y < h { cov[(y * w + x) as usize] = (c * 255.0 + 0.5).clamp(0.0, 255.0) as u8; }
+            });
+            let (ax, ay) = self.atlas_alloc(w + 2, h + 2);
+            for yy in 0..h {
+                for xx in 0..w {
+                    let idx = (((ay + 1 + yy) * TEXT_ATLAS_SIZE + (ax + 1 + xx)) * 4) as usize;
+                    let c = cov[(yy * w + xx) as usize];
+                    self.atlas_data[idx] = 255;
+                    self.atlas_data[idx + 1] = 255;
+                    self.atlas_data[idx + 2] = 255;
+                    self.atlas_data[idx + 3] = c;
+                }
+            }
+            self.atlas_dirty = true;
+            Glyph {
+                uv: [
+                    (ax + 1) as f32 / TEXT_ATLAS_SIZE as f32,
+                    (ay + 1) as f32 / TEXT_ATLAS_SIZE as f32,
+                    (ax + 1 + w) as f32 / TEXT_ATLAS_SIZE as f32,
+                    (ay + 1 + h) as f32 / TEXT_ATLAS_SIZE as f32,
+                ],
+                size: [w as f32, h as f32],
+                left: b.min.x,
+                top: -b.min.y,
+                advance,
+            }
+        } else {
+            Glyph { uv: [0.0; 4], size: [0.0, 0.0], left: 0.0, top: 0.0, advance }
+        };
+        self.glyphs.insert(key, glyph);
+        glyph
+    }
+
+    /// 文本渲染宽度（像素）。
+    pub fn measure_text(&self, text: &str, px: f32) -> f32 {
+        let scaled = self.font.as_scaled(PxScale::from(px));
+        text.chars().map(|c| scaled.h_advance(self.font.glyph_id(c))).sum()
+    }
+
+    /// 以 `(x, baseline_y)` 为基线、`px` 为字号绘制文本（用户空间，y 向上）。
+    pub fn draw_text(&mut self, text: &str, x: f32, baseline_y: f32, px: f32, color: [f32; 4]) {
+        let base = self.to_ndc();
+        let pxu = px.round().max(1.0) as u32;
+        let mut pen = x;
+        for ch in text.chars() {
+            let g = self.glyph_for(ch, pxu);
+            if g.size[0] > 0.0 {
+                let left = pen + g.left;
+                let top = baseline_y + g.top;
+                let (w, h) = (g.size[0], g.size[1]);
+                let (u0, v0, u1, v1) = (g.uv[0], g.uv[1], g.uv[2], g.uv[3]);
+                let tl = base([left, top]);
+                let tr = base([left + w, top]);
+                let br = base([left + w, top - h]);
+                let bl = base([left, top - h]);
+                for (p, uv) in [(tl, [u0, v0]), (tr, [u1, v0]), (br, [u1, v1]), (tl, [u0, v0]), (br, [u1, v1]), (bl, [u0, v1])] {
+                    self.text_vertices.push(NoteVertex { position: p, uv, color });
+                }
+            }
+            pen += g.advance;
+        }
+    }
+
+    /// 绘制一张打包进文本图集的 UI 图片（在用户空间中按 `center`/`size` 居中）。
+    pub fn draw_ui_image(&mut self, key: &str, center: [f32; 2], size: [f32; 2]) {
+        let Some(img) = self.ui_images.get(key).copied() else { return };
+        let base = self.to_ndc();
+        let (hw, hh) = (size[0] / 2.0, size[1] / 2.0);
+        let (u0, v0, u1, v1) = (img.uv[0], img.uv[1], img.uv[2], img.uv[3]);
+        let color = [1.0, 1.0, 1.0, 1.0];
+        let tl = base([center[0] - hw, center[1] + hh]);
+        let tr = base([center[0] + hw, center[1] + hh]);
+        let br = base([center[0] + hw, center[1] - hh]);
+        let bl = base([center[0] - hw, center[1] - hh]);
+        for (p, uv) in [(tl, [u0, v0]), (tr, [u1, v0]), (br, [u1, v1]), (tl, [u0, v0]), (br, [u1, v1]), (bl, [u0, v1])] {
+            self.text_vertices.push(NoteVertex { position: p, uv, color });
+        }
+    }
+
+    /// 音符贴图的高宽比（`height / width`），用于按宽度推算高度。
+    pub fn note_aspect(&self, texture: NoteTexture) -> f32 {
+        let size = self.note_tex_size[texture.index()];
+        size[1] / size[0]
+    }
+
+    /// 贴图非透明内容的横向范围占全宽比例。
+    pub fn note_alpha_width(&self, texture: NoteTexture) -> f32 {
+        self.note_tex_alpha[texture.index()]
+    }
+
+    /// 贴图蓝色主色内容的横向范围占全宽比例（无蓝色时退回 alpha 宽度）。
+    pub fn note_blue_width(&self, texture: NoteTexture) -> f32 {
+        self.note_tex_blue[texture.index()]
     }
 
     pub fn draw_block(&mut self, center: [f32; 2], width: f32, height: f32, angle: f32, color: [f32; 4], phase: f32) {
-        let (sx, sy, ox, oy) = self.viewport();
-        let size = self.size;
-        let angle = if self.y_up { -angle.to_radians() } else { angle.to_radians() };
-        let center = [self.origin[0] + center[0], self.origin[1] + if self.y_up { -center[1] } else { center[1] }];
-        let to_ndc = |p: [f32; 2]| { let px = ox + p[0] * sx; let py = oy + p[1] * sy; [px / size[0] * 2.0 - 1.0, 1.0 - py / size[1] * 2.0] };
-        let hx = width / 2.0; let hy = height / 2.0;
-        let dir = [angle.cos(), angle.sin()]; let perp = [-dir[1], dir[0]];
-        let corner = |dx: f32, dy: f32| to_ndc([center[0] + dir[0] * dx + perp[0] * dy, center[1] + dir[1] * dx + perp[1] * dy]);
+        let ctm = self.ctm;
+        let map = self.to_ndc();
+        let (hx, hy) = (width / 2.0, height / 2.0);
+        let rad = angle.to_radians();
+        // 垂直向量取 (sin, -cos)：`to_ndc` 里已并入 y 轴翻转，
+        // 与旧的「先取负角度再映射」等价，保证贴图朝向不变。
+        let dir = [rad.cos(), rad.sin()];
+        let perp = [rad.sin(), -rad.cos()];
+        let corner = |dx: f32, dy: f32| map(ctm.apply([center[0] + dir[0] * dx + perp[0] * dy, center[1] + dir[1] * dx + perp[1] * dy]));
         let a0 = corner(-hx, -hy); let a1 = corner(-hx, hy); let b1 = corner(hx, hy); let b0 = corner(hx, -hy);
         let v = |position: [f32; 2], uv: [f32; 2]| BlockVertex { position, uv, color, phase };
         for (pos, uv) in [(a0, [0.0, 1.0]), (a1, [0.0, 0.0]), (b1, [1.0, 0.0]), (a0, [0.0, 1.0]), (b1, [1.0, 0.0]), (b0, [1.0, 1.0])] {
@@ -661,7 +1164,7 @@ impl Renderer {
         }
     }
 
-    pub fn clear(&mut self) { self.lines.clear(); self.block_vertices.clear(); }
+    pub fn clear(&mut self) { self.lines.clear(); self.block_vertices.clear(); self.note_sprites.clear(); self.text_vertices.clear(); }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 { return; }
@@ -724,27 +1227,64 @@ impl Renderer {
         }
     }
 
+    /// 返回「用户坐标 -> NDC」的基础映射：按原点、y 轴方向（y 上时翻转 y）与视口缩放映射。
+    /// 不含 `ctm`——变换在 `draw_*` 时已捕获进各图元，绘制时对顶点应用。闭包只捕获副本。
+    fn to_ndc(&self) -> impl Fn([f32; 2]) -> [f32; 2] + use<> {
+        let origin = self.origin;
+        let y_up = self.y_up;
+        let size = self.size;
+        let (sx, sy, ox, oy) = self.viewport();
+        move |p: [f32; 2]| {
+            let px = ox + (origin[0] + p[0]) * sx;
+            let py = oy + (origin[1] + if y_up { -p[1] } else { p[1] }) * sy;
+            [px / size[0] * 2.0 - 1.0, 1.0 - py / size[1] * 2.0]
+        }
+    }
+
     pub fn render(&mut self) { self.render_impl(); }
 
     fn render_impl(&mut self) {
         self.fps.tick();
-        let (sx, sy, ox, oy) = self.viewport();
-        let size = self.size;
-        let origin = self.origin;
-        let y_up = self.y_up;
-        let to_ndc = |p: [f32; 2]| { let px = ox + p[0] * sx; let py = oy + p[1] * sy; [px / size[0] * 2.0 - 1.0, 1.0 - py / size[1] * 2.0] };
+        let base = self.to_ndc();
 
         self.vertices.clear();
-        for line in &self.lines {
-            let center = [origin[0] + line.center[0], origin[1] + if y_up { -line.center[1] } else { line.center[1] }];
-            let angle = if y_up { -line.angle } else { line.angle };
-            let corners = line::corners(center, line.length, angle, line.width);
-            let c0 = to_ndc(corners[0]); let c1 = to_ndc(corners[1]); let c2 = to_ndc(corners[2]); let c3 = to_ndc(corners[3]);
+        for d in &self.lines {
+            let l = d.line;
+            let corners = line::corners(l.center, l.length, l.angle, l.width);
+            let c0 = base(d.transform.apply(corners[0])); let c1 = base(d.transform.apply(corners[1])); let c2 = base(d.transform.apply(corners[2])); let c3 = base(d.transform.apply(corners[3]));
             let (mut min_x, mut max_x) = (c0[0], c0[0]); let (mut min_y, mut max_y) = (c0[1], c0[1]);
             for p in [c1, c2, c3] { min_x = min_x.min(p[0]); max_x = max_x.max(p[0]); min_y = min_y.min(p[1]); max_y = max_y.max(p[1]); }
             if max_x < -1.0 || min_x > 1.0 || max_y < -1.0 || min_y > 1.0 { continue; }
-            let color = line.color;
+            let color = l.color;
             for p in [c0, c1, c2, c0, c2, c3] { self.vertices.push(Vertex { position: p, color }); }
+        }
+
+        // 音符：按贴图分组生成顶点，记录每张贴图的连续绘制区间，避免逐个音符切换 bind group。
+        self.note_vertices.clear();
+        let mut note_draws: Vec<(usize, u32, u32)> = Vec::new();
+        if !self.note_sprites.is_empty() {
+            let mut order: Vec<usize> = (0..self.note_sprites.len()).collect();
+            order.sort_by_key(|&i| (self.note_sprites[i].layer, self.note_sprites[i].texture));
+            for &i in &order {
+                let s = self.note_sprites[i];
+                let start = self.note_vertices.len() as u32;
+                let (hw, hh) = (s.width / 2.0, s.height / 2.0);
+                let dir = [s.angle.cos(), s.angle.sin()];
+                let perp = [-dir[1], dir[0]];
+                let corner = |dx: f32, dy: f32| base(s.transform.apply([s.center[0] + dir[0] * dx + perp[0] * dy, s.center[1] + dir[1] * dx + perp[1] * dy]));
+                let a0 = corner(-hw, -hh); let a1 = corner(-hw, hh); let b1 = corner(hw, hh); let b0 = corner(hw, -hh);
+                let v = |position: [f32; 2], uv: [f32; 2]| NoteVertex { position, uv, color: s.color };
+                let (u0, u1) = (s.uv_x[0], s.uv_x[1]);
+                for (pos, uv) in [(a0, [u0, 1.0]), (a1, [u0, 0.0]), (b1, [u1, 0.0]), (a0, [u0, 1.0]), (b1, [u1, 0.0]), (b0, [u1, 1.0])] {
+                    self.note_vertices.push(v(pos, uv));
+                }
+                match note_draws.last_mut() {
+                    Some((t, _, count)) if *t == s.texture => *count += 6,
+                    _ => note_draws.push((s.texture, start, 6)),
+                }
+            }
+            self.ensure_note_capacity(self.note_vertices.len());
+            self.queue.write_buffer(&self.note_buffer, 0, bytemuck::cast_slice(&self.note_vertices));
         }
 
         let line_count = self.vertices.len() as u32;
@@ -780,11 +1320,28 @@ impl Renderer {
             self.queue.write_buffer(&self.block_uniform, 0, bytemuck::bytes_of(&uniform));
         }
 
-        self.draw_frame(block_count, line_count);
+        // 文本/UI 图集：有新字形/图片时整张上传（首帧含 UI 图片）。
+        if self.atlas_dirty {
+            self.queue.write_texture(
+                self.text_atlas_tex.as_image_copy(),
+                &self.atlas_data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * TEXT_ATLAS_SIZE), rows_per_image: Some(TEXT_ATLAS_SIZE) },
+                wgpu::Extent3d { width: TEXT_ATLAS_SIZE, height: TEXT_ATLAS_SIZE, depth_or_array_layers: 1 },
+            );
+            self.atlas_dirty = false;
+        }
+        if !self.text_vertices.is_empty() {
+            self.ensure_text_capacity(self.text_vertices.len());
+            self.queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&self.text_vertices));
+        }
+
+        self.draw_frame(block_count, line_count, &note_draws);
     }
 
     fn ensure_vertex_capacity(&mut self, needed: usize) { if needed <= self.vertex_capacity { return; } let c = needed.next_power_of_two(); self.vertex_buffer = create_vertex_buffer(&self.device, c); self.vertex_capacity = c; }
     fn ensure_block_capacity(&mut self, needed: usize) { if needed <= self.block_capacity { return; } let c = needed.next_power_of_two(); self.block_vertex_buffer = create_block_vertex_buffer(&self.device, c); self.block_capacity = c; }
+    fn ensure_note_capacity(&mut self, needed: usize) { if needed <= self.note_capacity { return; } let c = needed.next_power_of_two(); self.note_buffer = create_note_vertex_buffer(&self.device, c); self.note_capacity = c; }
+    fn ensure_text_capacity(&mut self, needed: usize) { if needed <= self.text_capacity { return; } let c = needed.next_power_of_two(); self.text_buffer = create_note_vertex_buffer(&self.device, c); self.text_capacity = c; }
 
     fn phase_range(&self, phase: f32) -> (u32, u32) {
         let start = self.block_vertices.partition_point(|v| v.phase < phase) as u32;
@@ -792,7 +1349,7 @@ impl Renderer {
         (start, end)
     }
 
-    fn draw_frame(&mut self, block_count: u32, line_count: u32) {
+    fn draw_frame(&mut self, block_count: u32, line_count: u32, note_draws: &[(usize, u32, u32)]) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => { self.surface.configure(&self.device, &self.config); return; }
@@ -859,6 +1416,15 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.draw(0..line_count, 0..1);
             }
+            // 音符（在判定线之上、DisabledBlock 之下）
+            if !note_draws.is_empty() {
+                pass.set_pipeline(&self.note_pipeline);
+                pass.set_vertex_buffer(0, self.note_buffer.slice(..));
+                for (tex, start, count) in note_draws {
+                    pass.set_bind_group(0, &self.note_bind_groups[*tex], &[]);
+                    pass.draw(*start..*start + *count, 0..1);
+                }
+            }
             if block_count > 0 {
                 pass.set_pipeline(&self.disabled_pipeline);
                 pass.set_bind_group(0, &self.disabled_bg, &[]);
@@ -877,6 +1443,18 @@ impl Renderer {
             pass.set_pipeline(&self.active_pipeline);
             pass.set_bind_group(0, &self.active_bg, &[]);
             pass.draw(0..3, 0..1);
+        }
+        // 3.5) HUD（分数/连击/暂停/进度/水印）：叠加到 scene_full 最上层
+        if !self.text_vertices.is_empty() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("text"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.rt_scene_full.1, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.text_pipeline);
+            pass.set_bind_group(0, &self.text_bg, &[]);
+            pass.set_vertex_buffer(0, self.text_buffer.slice(..));
+            pass.draw(0..self.text_vertices.len() as u32, 0..1);
         }
         // 4) 合成结果拷贝到交换链
         self.fullscreen_pass(&mut encoder, &view, &self.copy_pipeline, &self.copy_bg);
@@ -907,6 +1485,30 @@ impl Renderer {
 
 // ---- 辅助 ----
 
+/// 文本图集货架式打包：返回左上角，并推进游标 `(x, y, 行高)`。
+fn atlas_pack(cursor: &mut (u32, u32, u32), w: u32, h: u32) -> (u32, u32) {
+    let (mut x, mut y, mut row_h) = *cursor;
+    if x + w > TEXT_ATLAS_SIZE { x = 0; y += row_h; row_h = 0; }
+    if y + h > TEXT_ATLAS_SIZE { panic!("文本图集已满"); }
+    let pos = (x, y);
+    x += w;
+    row_h = row_h.max(h);
+    *cursor = (x, y, row_h);
+    pos
+}
+
+/// 把一张 RGBA 图片写入图集数据（不处理 alpha 预乘）。
+fn atlas_blit(data: &mut [u8], x: u32, y: u32, img: &image::RgbaImage) {
+    let (w, h) = (img.width(), img.height());
+    for yy in 0..h {
+        for xx in 0..w {
+            let px = img.get_pixel(xx, yy).0;
+            let idx = (((y + yy) * TEXT_ATLAS_SIZE + (x + xx)) * 4) as usize;
+            data[idx..idx + 4].copy_from_slice(&px);
+        }
+    }
+}
+
 fn glow_weights() -> Vec<f32> {
     let mut sum = 0.0f32;
     for i in 1..=GLOW_RADIUS { sum += (i as f32).powf(GLOW_FALLOFF); }
@@ -919,20 +1521,70 @@ fn glow_weights() -> Vec<f32> {
     w
 }
 
-struct LoadedTexture { view: wgpu::TextureView }
+struct LoadedTexture { view: wgpu::TextureView, size: [u32; 2], alpha_width: f32, blue_width: f32 }
 
-fn load_texture(device: &wgpu::Device, queue: &wgpu::Queue, path: &str, srgb: bool) -> LoadedTexture {
-    let dyn_image = image::open(path).unwrap_or_else(|e| panic!("加载贴图 {path} 失败: {e}"));
+/// 加载内嵌资源（键相对 `assets/`、正斜杠）为贴图。
+fn load_texture(device: &wgpu::Device, queue: &wgpu::Queue, key: &str, srgb: bool) -> LoadedTexture {
+    load_texture_tinted(device, queue, key, srgb, None)
+}
+
+/// 同 [`load_texture`]，但可把像素 RGB 统一替换为 `tint`（保留 alpha），用于把打击特效
+/// 贴图染成金色（参考 CHCAT_Phi 的 `applyGoldenEffect`）。
+fn load_texture_tinted(device: &wgpu::Device, queue: &wgpu::Queue, key: &str, srgb: bool, tint: Option<[u8; 3]>) -> LoadedTexture {
+    load_texture_bytes(device, queue, key, crate::embedded::expect(key), srgb, tint)
+}
+
+/// 从磁盘文件加载贴图（背景图随谱面提供，不内嵌）。
+fn load_texture_file(device: &wgpu::Device, queue: &wgpu::Queue, path: &str, srgb: bool) -> LoadedTexture {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("读取贴图 {path} 失败: {e}"));
+    load_texture_bytes(device, queue, path, &bytes, srgb, None)
+}
+
+/// 从内存字节解码并创建贴图。
+fn load_texture_bytes(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8], srgb: bool, tint: Option<[u8; 3]>) -> LoadedTexture {
+    let dyn_image = image::load_from_memory(bytes).unwrap_or_else(|e| panic!("解码贴图 {label} 失败: {e}"));
     let (width, height) = (dyn_image.width(), dyn_image.height());
-    let data = dyn_image.to_rgba8();
+    let mut data = dyn_image.to_rgba8();
+    if let Some([r, g, b]) = tint {
+        for px in data.pixels_mut() {
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+        }
+    }
+    // 贴图左右往往有透明留白。`alpha_width` 为非透明内容的横向范围；
+    // `blue_width` 为「蓝色主色（B 明显大于 R、G）」内容的横向范围（排除 HL 的黄色辉光），
+    // 供 Hold 头/尾按颜色与主体对齐。
+    let mut vmin = width;
+    let mut vmax = 0u32;
+    let mut bmin = width;
+    let mut bmax = 0u32;
+    for x in 0..width {
+        for y in 0..height {
+            let px = data.get_pixel(x, y);
+            if px[3] > 8 {
+                if x < vmin { vmin = x; }
+                if x > vmax { vmax = x; }
+                if px[2] > px[0].saturating_add(24) && px[2] > px[1] {
+                    if x < bmin { bmin = x; }
+                    if x > bmax { bmax = x; }
+                }
+                break;
+            }
+        }
+    }
+    let ratio = |lo: u32, hi: u32| if hi >= lo && lo < width { (hi - lo + 1) as f32 / width as f32 } else { 0.0 };
+    let alpha_width = ratio(vmin, vmax).max(0.01);
+    let blue = ratio(bmin, bmax);
+    let blue_width = if blue > 0.0 { blue } else { alpha_width };
     let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(path), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+        label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
         dimension: wgpu::TextureDimension::D2, format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
     });
     queue.write_texture(texture.as_image_copy(), data.as_raw().as_slice(), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * width), rows_per_image: Some(height) }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
-    LoadedTexture { view: texture.create_view(&wgpu::TextureViewDescriptor::default()) }
+    LoadedTexture { view: texture.create_view(&wgpu::TextureViewDescriptor::default()), size: [width, height], alpha_width, blue_width }
 }
 
 fn solid_texture(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4]) -> wgpu::TextureView {
@@ -1002,6 +1654,7 @@ fn create_glow_final_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "gl
 fn create_disabled_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "disabled", &[ub(0), tex(1), tex(2), tex(3), smp(4), smp(5), smp(6)]) }
 fn create_active_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "active", &[ub(0), tex(1), tex(2), tex(3), tex(4), tex(5), tex(6), tex(7), smp(8), smp(9), smp(10), tex(11), smp(12)]) }
 fn create_copy_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "copy", &[tex(0), smp(1)]) }
+fn create_note_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "note", &[tex(0), smp(1)]) }
 
 fn bg_sprite(d: &wgpu::Device, u: &wgpu::Buffer, t0: &wgpu::TextureView, s: &wgpu::Sampler) -> wgpu::BindGroup {
     d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_sprite_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(s) }] })
@@ -1030,6 +1683,10 @@ fn bg_active(d: &wgpu::Device, u: &wgpu::Buffer, t0: &wgpu::TextureView, t1: &wg
 }
 fn bg_copy(d: &wgpu::Device, t0: &wgpu::TextureView, s: &wgpu::Sampler) -> wgpu::BindGroup {
     d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_copy_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(s) }] })
+}
+
+fn bg_note(d: &wgpu::Device, bgl: &wgpu::BindGroupLayout, t0: &wgpu::TextureView, s: &wgpu::Sampler) -> wgpu::BindGroup {
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("note"), layout: bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(s) }] })
 }
 
 fn pipeline_layout(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> wgpu::PipelineLayout {
@@ -1067,6 +1724,23 @@ fn create_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer 
 }
 fn create_block_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor { label: Some("block vertices"), size: (std::mem::size_of::<BlockVertex>() * capacity) as wgpu::BufferAddress, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+}
+fn create_note_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor { label: Some("note vertices"), size: (std::mem::size_of::<NoteVertex>() * capacity) as wgpu::BufferAddress, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+}
+
+/// 音符精灵管线：采样贴图 × 顶点色，Alpha 混合，写入场景 MSAA RT。
+fn build_note_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32, bgl: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("note"), source: wgpu::ShaderSource::Wgsl(NOTE_SHADER.into()) });
+    let layout = pipeline_layout(device, bgl);
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("note"), layout: Some(&layout),
+        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(NoteVertex::layout())] },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+        depth_stencil: None, multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+        multiview_mask: None, cache: None,
+    })
 }
 
 #[cfg(test)]

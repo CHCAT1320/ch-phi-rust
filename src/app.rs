@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -13,7 +12,7 @@ use winit::window::{Window, WindowId};
 
 use crate::chart_fv::Chart;
 use crate::render_block;
-use crate::render_chart;
+use crate::render_chart::{self, ChartRuntime};
 use crate::renderer::{Fit, Renderer};
 
 /// 窗口标题。
@@ -27,7 +26,6 @@ const WINDOW_HEIGHT: f64 = 600.0;
 
 /// 渲染线程句柄：主线程通过它把窗口尺寸变化发给渲染线程，并在退出时停止它。
 struct Engine {
-    resize_tx: SyncSender<[u32; 2]>,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -57,20 +55,33 @@ pub struct App {
     chart: Option<Chart>,
     /// 待交给渲染线程的音乐。
     music: Option<Music>,
+    /// 待交给渲染线程的谱面运行时（打击音效/特效状态）。
+    runtime: Option<ChartRuntime>,
     /// 背景图路径（`IllustrationBlur.0.png`，可能不存在）。
     illustration: Option<String>,
+    /// 窗口图标（内嵌 `assets/icon/icon.jpg` 解码而来）。
+    icon: Option<winit::window::Icon>,
 }
 
 impl App {
-    /// 创建应用，接收已初始化的音频、谱面与音乐。
-    pub fn new(audio: AudioManager, chart: Chart, music: Music, illustration: Option<String>) -> Self {
+    /// 创建应用，接收已初始化的音频、谱面、音乐与谱面运行时。
+    pub fn new(
+        audio: AudioManager,
+        chart: Chart,
+        music: Music,
+        runtime: ChartRuntime,
+        illustration: Option<String>,
+        icon: Option<winit::window::Icon>,
+    ) -> Self {
         Self {
             window: None,
             engine: None,
             audio: Some(audio),
             chart: Some(chart),
             music: Some(music),
+            runtime: Some(runtime),
             illustration,
+            icon,
         }
     }
 }
@@ -84,32 +95,48 @@ impl ApplicationHandler for App {
         }
 
         // 可任意缩放的窗口
-        let attributes = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut attributes = Window::default_attributes()
             .with_title(WINDOW_TITLE)
-            .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+            .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+            .with_window_icon(self.icon.clone());
+        // `with_window_icon` 在 Windows 上只设置小图标（标题栏）；任务栏用的是大图标，
+        // 需通过平台扩展单独设置 `taskbar_icon`。
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes = attributes.with_taskbar_icon(self.icon.clone());
+        }
 
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
+        // 窗口创建后再设置一次图标：部分 Windows 版本在创建时设置的任务栏大图标会被外壳忽略。
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowExtWindows;
+            window.set_window_icon(self.icon.clone());
+            window.set_taskbar_icon(self.icon.clone());
+        }
         let renderer = Renderer::new(window.clone(), self.illustration.take());
 
         // 启动渲染线程
-        let (resize_tx, resize_rx) = mpsc::sync_channel(64);
         let running = Arc::new(AtomicBool::new(true));
         let chart = self.chart.take().unwrap();
         let music = self.music.take().unwrap();
+        let runtime = self.runtime.take().unwrap();
         let running_thread = Arc::clone(&running);
+        let render_window = Arc::clone(&window);
         let handle = thread::spawn(move || {
-            render_loop(renderer, chart, music, resize_rx, running_thread);
+            render_loop(renderer, chart, music, runtime, render_window, running_thread);
         });
 
         self.window = Some(window);
         self.engine = Some(Engine {
-            resize_tx,
             running,
             handle: Some(handle),
         });
     }
 
-    /// 处理窗口事件：关闭、尺寸/缩放变化。
+    /// 处理窗口事件：关闭与尺寸变化（尺寸变化仅用于音频恢复）。
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -124,22 +151,11 @@ impl ApplicationHandler for App {
                 }
                 event_loop.exit();
             }
-            // 尺寸变化：通知渲染线程
-            WindowEvent::Resized(size) => {
-                if let Some(engine) = &self.engine {
-                    let _ = engine.resize_tx.try_send([size.width, size.height]);
-                }
+            // 尺寸变化只用于音频恢复；渲染线程自行轮询窗口大小（见 `render_loop`），
+            // 因为拖动/缩放窗口期间 winit 会把 `Resized` 缓冲到松开鼠标后才派发。
+            WindowEvent::Resized(_) => {
                 if let Some(audio) = &mut self.audio {
                     audio.recover_if_needed().ok();
-                }
-            }
-            // 缩放因子变化：按新的物理尺寸通知渲染线程
-            WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(window) = &self.window {
-                    let size = window.inner_size();
-                    if let Some(engine) = &self.engine {
-                        let _ = engine.resize_tx.try_send([size.width, size.height]);
-                    }
                 }
             }
             _ => {}
@@ -161,16 +177,24 @@ fn render_loop(
     mut renderer: Renderer,
     chart: Chart,
     music: Music,
-    resize_rx: Receiver<[u32; 2]>,
+    mut runtime: ChartRuntime,
+    window: Arc<Window>,
     running: Arc<AtomicBool>,
 ) {
     let mut last_report = Instant::now();
     let start = Instant::now();
+    let initial = renderer.window_size();
+    let mut last_size = [initial[0] as u32, initial[1] as u32];
 
     while running.load(Ordering::Relaxed) {
-        // 应用渲染线程收到的最新窗口尺寸
-        while let Ok([w, h]) = resize_rx.try_recv() {
-            renderer.resize(w, h);
+        // 直接轮询窗口物理尺寸。Windows 在拖动/缩放时进入系统模态循环，winit 会把
+        // `Resized` 缓冲到松手后才派发，若只依赖该事件，拖动期间判定线尺寸不变、
+        // 交换链也不重配，看起来就是「窗口不刷新」。轮询可绕开这个缓冲。
+        let physical = window.inner_size();
+        let size = [physical.width, physical.height];
+        if size[0] > 0 && size[1] > 0 && size != last_size {
+            last_size = size;
+            renderer.resize(size[0], size[1]);
         }
 
         // 清屏
@@ -186,7 +210,7 @@ fn render_loop(
         let chart_time = music.position() - chart.offset;
         let shader_time = start.elapsed().as_secs_f32();
         render_block::render(&mut renderer, &chart.block_area_list, chart_time, shader_time);
-        render_chart::render(&mut renderer, &chart, music.position());
+        render_chart::render(&mut renderer, &chart, &mut runtime, music.position());
 
         // 渲染上屏
         renderer.render();
