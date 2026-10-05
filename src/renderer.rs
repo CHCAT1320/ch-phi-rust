@@ -696,6 +696,10 @@ pub struct Renderer {
 
     block_time: f32,
     size: [f32; 2],
+    /// 实际渲染尺寸（导出时为视频尺寸；窗口播放时等于 `size`）。RT 与坐标映射基于它。
+    render_size: [f32; 2],
+    /// 游戏画面缩放比例（`--size`，1.0 = 铺满渲染尺寸）。
+    render_scale: f32,
     design: [f32; 2],
     fit: Fit,
     origin: [f32; 2],
@@ -742,6 +746,15 @@ pub struct Renderer {
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
     text_vertices: Vec<NoteVertex>,
+
+    /// 视频导出的离屏渲染目标（`RENDER_ATTACHMENT | COPY_SRC`）。
+    export_rt: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// 视频导出的回读缓冲（`COPY_DST | MAP_READ`）。
+    export_buffer: Option<wgpu::Buffer>,
+    /// 回读缓冲每行对齐后的字节数（`COPY_BYTES_PER_ROW_ALIGNMENT` 对齐）。
+    export_padded_bytes_per_row: u32,
+    /// 导出尺寸 `[w, h]`。
+    export_size: [u32; 2],
 }
 
 impl Renderer {
@@ -849,6 +862,27 @@ impl Renderer {
                 },
             );
         }
+        // 16×16 纯白，供绘制纯色矩形（进度条等）；足够大以免线性过滤把边缘滤空。
+        {
+            let (ax, ay) = atlas_pack(&mut atlas_cursor, 18, 18);
+            for yy in 0..16u32 {
+                for xx in 0..16u32 {
+                    let idx = (((ay + 1 + yy) * TEXT_ATLAS_SIZE + (ax + 1 + xx)) * 4) as usize;
+                    atlas_data[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+            ui_images.insert(
+                "ui/white".to_string(),
+                UiImage {
+                    uv: [
+                        (ax + 1) as f32 / TEXT_ATLAS_SIZE as f32,
+                        (ay + 1) as f32 / TEXT_ATLAS_SIZE as f32,
+                        (ax + 17) as f32 / TEXT_ATLAS_SIZE as f32,
+                        (ay + 17) as f32 / TEXT_ATLAS_SIZE as f32,
+                    ],
+                },
+            );
+        }
         let text_atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("text atlas"),
             size: wgpu::Extent3d { width: TEXT_ATLAS_SIZE, height: TEXT_ATLAS_SIZE, depth_or_array_layers: 1 },
@@ -859,7 +893,7 @@ impl Renderer {
         let text_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("text sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest, mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let text_bg = bg_note(&device, &note_bgl, &text_atlas_view, &text_sampler);
@@ -949,11 +983,12 @@ impl Renderer {
             block_vertex_buffer, block_capacity: INITIAL_BLOCK_CAPACITY, block_uniform, glow_configs, rt_sampler, disp_sampler, spark_sampler, effect_sampler,
             disp_view: disp_tex.view, spark_view: spark_tex.view,
             rt_normal, rt_subtract, rt_disabled_normal, rt_disabled_subtract, rt_ready_normal, rt_ready_subtract, rt_composed_enabled, rt_composed_disabled, rt_effect, ping_a, ping_b, rt_scene_full, rt_scene, mask_msaa, scene_full_msaa,
-            block_time: 0.0, size: surface_size, design, fit: Fit::default(), origin: [0.0, 0.0], y_up: false, ctm: Affine2::IDENTITY, transform_stack: Vec::new(), fps: Fps::new(), vsync,
+            block_time: 0.0, size: surface_size, render_size: surface_size, render_scale: 1.0, design, fit: Fit::default(), origin: [0.0, 0.0], y_up: false, ctm: Affine2::IDENTITY, transform_stack: Vec::new(), fps: Fps::new(), vsync,
             lines: Vec::new(), vertices: Vec::new(), block_vertices: Vec::new(),
             note_pipeline, note_bind_groups, note_tex_size, note_tex_alpha, note_tex_blue, note_buffer, note_capacity: INITIAL_NOTE_CAPACITY, note_vertices: Vec::new(), note_sprites: Vec::new(), hit_frame_count,
             font, glyphs: HashMap::new(), ui_images, atlas_data, atlas_x: atlas_cursor.0, atlas_y: atlas_cursor.1, atlas_row_h: atlas_cursor.2, atlas_dirty: true,
             text_atlas_tex, text_bg, text_pipeline, text_buffer, text_capacity: INITIAL_NOTE_CAPACITY, text_vertices: Vec::new(),
+            export_rt: None, export_buffer: None, export_padded_bytes_per_row: 0, export_size: [0, 0],
         }
     }
 
@@ -986,6 +1021,10 @@ impl Renderer {
     pub fn scale(&mut self, sx: f32, sy: f32) { self.ctm = self.ctm.mul(Affine2::scale(sx, sy)); }
 
     pub fn window_size(&self) -> [f32; 2] { self.size }
+    /// 实际渲染尺寸（导出时为视频尺寸）。
+    pub fn render_size(&self) -> [f32; 2] { self.render_size }
+    /// 设置游戏画面缩放比例（`--size`）。
+    pub fn set_render_scale(&mut self, s: f32) { self.render_scale = s.max(0.01); }
     pub fn set_viewport(&mut self, design: [f32; 2], fit: Fit) { self.design = design; self.fit = fit; }
     pub fn set_time(&mut self, time: f32) { self.block_time = time; }
 
@@ -1117,15 +1156,38 @@ impl Renderer {
 
     /// 绘制一张打包进文本图集的 UI 图片（在用户空间中按 `center`/`size` 居中）。
     pub fn draw_ui_image(&mut self, key: &str, center: [f32; 2], size: [f32; 2]) {
+        self.draw_ui_image_color(key, center, size, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    /// 同 [`draw_ui_image`]，但用 `color` 着色（用于纯色矩形/进度条）。
+    pub fn draw_ui_image_color(&mut self, key: &str, center: [f32; 2], size: [f32; 2], color: [f32; 4]) {
         let Some(img) = self.ui_images.get(key).copied() else { return };
         let base = self.to_ndc();
         let (hw, hh) = (size[0] / 2.0, size[1] / 2.0);
         let (u0, v0, u1, v1) = (img.uv[0], img.uv[1], img.uv[2], img.uv[3]);
-        let color = [1.0, 1.0, 1.0, 1.0];
         let tl = base([center[0] - hw, center[1] + hh]);
         let tr = base([center[0] + hw, center[1] + hh]);
         let br = base([center[0] + hw, center[1] - hh]);
         let bl = base([center[0] - hw, center[1] - hh]);
+        for (p, uv) in [(tl, [u0, v0]), (tr, [u1, v0]), (br, [u1, v1]), (tl, [u0, v0]), (br, [u1, v1]), (bl, [u0, v1])] {
+            self.text_vertices.push(NoteVertex { position: p, uv, color });
+        }
+    }
+
+    /// 绘制纯色矩形（基于图集内的 1×1 白色块）。
+    pub fn draw_rect(&mut self, center: [f32; 2], size: [f32; 2], color: [f32; 4]) {
+        self.draw_ui_image_color("ui/white", center, size, color);
+    }
+
+    /// 直接以 NDC 坐标绘制纯色矩形（不受坐标缩放影响，用于视口边框等叠加）。
+    pub fn draw_rect_ndc(&mut self, center: [f32; 2], size: [f32; 2], color: [f32; 4]) {
+        let Some(img) = self.ui_images.get("ui/white").copied() else { return };
+        let (hw, hh) = (size[0] / 2.0, size[1] / 2.0);
+        let (u0, v0, u1, v1) = (img.uv[0], img.uv[1], img.uv[2], img.uv[3]);
+        let tl = [center[0] - hw, center[1] + hh];
+        let tr = [center[0] + hw, center[1] + hh];
+        let br = [center[0] + hw, center[1] - hh];
+        let bl = [center[0] - hw, center[1] - hh];
         for (p, uv) in [(tl, [u0, v0]), (tr, [u1, v0]), (br, [u1, v1]), (tl, [u0, v0]), (br, [u1, v1]), (bl, [u0, v1])] {
             self.text_vertices.push(NoteVertex { position: p, uv, color });
         }
@@ -1171,7 +1233,19 @@ impl Renderer {
         self.config.width = width; self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.size = [width as f32, height as f32];
+        self.render_size = [width as f32, height as f32];
+        self.recreate_targets(width, height);
+    }
 
+    /// 设定实际渲染/导出尺寸（不改动窗口 surface）。导出时窗口与视频尺寸分离。
+    pub fn set_render_size(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 { return; }
+        self.render_size = [width as f32, height as f32];
+        self.recreate_targets(width, height);
+    }
+
+    /// 按给定尺寸重建全部离屏 RT 与相关绑定。
+    fn recreate_targets(&mut self, width: u32, height: u32) {
         let mask_size = mask_dimensions(width, height);
         let effect_size = effect_dimensions(width, height);
         let (m_normal, rt_normal) = create_rt_msaa(&self.device, mask_size, "normal", BLOCK_FORMAT);
@@ -1219,12 +1293,17 @@ impl Renderer {
     }
 
     fn viewport(&self) -> (f32, f32, f32, f32) {
-        let (win_w, win_h) = (self.size[0], self.size[1]);
+        let (win_w, win_h) = (self.render_size[0], self.render_size[1]);
         let (design_w, design_h) = (self.design[0], self.design[1]);
-        match self.fit {
-            Fit::Stretch => (win_w / design_w, win_h / design_h, 0.0, 0.0),
-            Fit::Contain => { let s = (win_w / design_w).min(win_h / design_h); (s, s, (win_w - design_w * s) / 2.0, (win_h - design_h * s) / 2.0) }
-        }
+        let (mut sx, mut sy) = match self.fit {
+            Fit::Stretch => (win_w / design_w, win_h / design_h),
+            Fit::Contain => { let s = (win_w / design_w).min(win_h / design_h); (s, s) }
+        };
+        sx *= self.render_scale;
+        sy *= self.render_scale;
+        let ox = (win_w - design_w * sx) / 2.0;
+        let oy = (win_h - design_h * sy) / 2.0;
+        (sx, sy, ox, oy)
     }
 
     /// 返回「用户坐标 -> NDC」的基础映射：按原点、y 轴方向（y 上时翻转 y）与视口缩放映射。
@@ -1232,7 +1311,7 @@ impl Renderer {
     fn to_ndc(&self) -> impl Fn([f32; 2]) -> [f32; 2] + use<> {
         let origin = self.origin;
         let y_up = self.y_up;
-        let size = self.size;
+        let size = self.render_size;
         let (sx, sy, ox, oy) = self.viewport();
         move |p: [f32; 2]| {
             let px = ox + (origin[0] + p[0]) * sx;
@@ -1245,6 +1324,21 @@ impl Renderer {
 
     fn render_impl(&mut self) {
         self.fps.tick();
+        let (block_count, line_count, note_draws) = self.prepare_frame();
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => { self.surface.configure(&self.device, &self.config); return; }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return,
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        self.encode_scene(&mut encoder, &view, block_count, line_count, &note_draws);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.present(frame);
+    }
+
+    /// 构建本帧全部顶点/贴图上传，返回 `(块顶点数, 线段顶点数, 音符绘制区间)`。
+    fn prepare_frame(&mut self) -> (u32, u32, Vec<(usize, u32, u32)>) {
         let base = self.to_ndc();
 
         self.vertices.clear();
@@ -1295,8 +1389,10 @@ impl Renderer {
             self.block_vertices.sort_by(|a, b| a.phase.partial_cmp(&b.phase).unwrap());
             self.ensure_block_capacity(self.block_vertices.len());
             self.queue.write_buffer(&self.block_vertex_buffer, 0, bytemuck::cast_slice(&self.block_vertices));
-            let ew = (self.config.width / EFFECT_DOWNSCALE).max(1);
-            let eh = (self.config.height / EFFECT_DOWNSCALE).max(1);
+            let rw = self.render_size[0] as u32;
+            let rh = self.render_size[1] as u32;
+            let ew = (rw / EFFECT_DOWNSCALE).max(1);
+            let eh = (rh / EFFECT_DOWNSCALE).max(1);
             let uniform = BlockUniform {
                 fill: [0.713, 0.235, 0.235, 0.667],
                 edge: [1.0, 0.330, 0.330, 0.80],
@@ -1311,7 +1407,7 @@ impl Renderer {
                 displace_compose: [2.59, 0.10, 0.5, 0.5],
                 st_compose: [2.13, 1.02, 0.0, 0.0],
                 st_active: [0.80, 0.30, 0.0, 0.0],
-                screen: [self.config.width as f32, self.config.height as f32, 1.0 / self.config.width as f32, 1.0 / self.config.height as f32],
+                screen: [self.render_size[0], self.render_size[1], 1.0 / self.render_size[0], 1.0 / self.render_size[1]],
                 blend: [0.09, 0.12, 0.0, 0.0],
                 dis_spark: [0.311, 0.078, 0.078, 3.5],
                 dis_params: [0.30, 2.29, 0.0, 0.0],
@@ -1320,7 +1416,12 @@ impl Renderer {
             self.queue.write_buffer(&self.block_uniform, 0, bytemuck::bytes_of(&uniform));
         }
 
-        // 文本/UI 图集：有新字形/图片时整张上传（首帧含 UI 图片）。
+        self.upload_text();
+        (block_count, line_count, note_draws)
+    }
+
+    /// 上传文本图集（有变化时）与文本顶点。
+    fn upload_text(&mut self) {
         if self.atlas_dirty {
             self.queue.write_texture(
                 self.text_atlas_tex.as_image_copy(),
@@ -1334,8 +1435,6 @@ impl Renderer {
             self.ensure_text_capacity(self.text_vertices.len());
             self.queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&self.text_vertices));
         }
-
-        self.draw_frame(block_count, line_count, &note_draws);
     }
 
     fn ensure_vertex_capacity(&mut self, needed: usize) { if needed <= self.vertex_capacity { return; } let c = needed.next_power_of_two(); self.vertex_buffer = create_vertex_buffer(&self.device, c); self.vertex_capacity = c; }
@@ -1349,15 +1448,7 @@ impl Renderer {
         (start, end)
     }
 
-    fn draw_frame(&mut self, block_count: u32, line_count: u32, note_draws: &[(usize, u32, u32)]) {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => { self.surface.configure(&self.device, &self.config); return; }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return,
-        };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-
+    fn encode_scene(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, block_count: u32, line_count: u32, note_draws: &[(usize, u32, u32)]) {
         if block_count > 0 {
             // 6 张遮罩：普通块用 BlockSprite，减块用 SubtractBlockBlender（逐 quad）
             let targets = [&self.rt_normal.1, &self.rt_subtract.1, &self.rt_disabled_normal.1, &self.rt_disabled_subtract.1, &self.rt_ready_normal.1, &self.rt_ready_subtract.1];
@@ -1382,17 +1473,17 @@ impl Renderer {
             }
 
             // compose1 / compose2
-            self.fullscreen_pass(&mut encoder, &self.rt_composed_enabled.1, &self.compose1_pipeline, &self.compose1_bg);
-            self.fullscreen_pass(&mut encoder, &self.rt_composed_disabled.1, &self.compose2_pipeline, &self.compose2_bg);
+            self.fullscreen_pass(encoder, &self.rt_composed_enabled.1, &self.compose1_pipeline, &self.compose1_bg);
+            self.fullscreen_pass(encoder, &self.rt_composed_disabled.1, &self.compose2_pipeline, &self.compose2_bg);
             // edge -> effect.R
-            self.fullscreen_pass(&mut encoder, &self.rt_effect.1, &self.edge_pipeline, &self.edge_bg);
+            self.fullscreen_pass(encoder, &self.rt_effect.1, &self.edge_pipeline, &self.edge_bg);
             // glow ping-pong
             let outputs = [&self.ping_a.1, &self.ping_b.1, &self.ping_a.1, &self.ping_b.1, &self.ping_a.1];
             for i in 0..self.glow_bgs.len() {
-                self.fullscreen_pass(&mut encoder, outputs[i], &self.glow_pipeline, &self.glow_bgs[i]);
+                self.fullscreen_pass(encoder, outputs[i], &self.glow_pipeline, &self.glow_bgs[i]);
             }
             // 末轮只写 effect.G（保留 effect.R 的边缘），故必须 load 而非 clear
-            self.fullscreen_pass_load(&mut encoder, &self.rt_effect.1, &self.glow_final_pipeline, &self.glow_final_bg);
+            self.fullscreen_pass_load(encoder, &self.rt_effect.1, &self.glow_final_pipeline, &self.glow_final_bg);
         }
 
         // 1) 背景 + 压暗 + 判定线 + DisabledBlock：一次 4×MSAA 渲染到 scene_full_msaa，
@@ -1432,7 +1523,7 @@ impl Renderer {
             }
         }
         // 2) Blit(CameraTarget -> sceneColorRT)，供 ActiveBlock 的 `_SceneColor`
-        self.fullscreen_pass(&mut encoder, &self.rt_scene.1, &self.copy_pipeline, &self.copy_bg);
+        self.fullscreen_pass(encoder, &self.rt_scene.1, &self.copy_pipeline, &self.copy_bg);
         // 3) ActiveBlock 预乘覆盖到 scene_full（此时 `_SceneColor` 已就绪）
         if block_count > 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1456,9 +1547,137 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.text_buffer.slice(..));
             pass.draw(0..self.text_vertices.len() as u32, 0..1);
         }
-        // 4) 合成结果拷贝到交换链
-        self.fullscreen_pass(&mut encoder, &view, &self.copy_pipeline, &self.copy_bg);
+        // 4) 合成结果拷贝到目标（交换链或离屏导出纹理）
+        self.fullscreen_pass(encoder, view, &self.copy_pipeline, &self.copy_bg);
+    }
 
+    /// 渲染一帧到离屏导出纹理（供视频导出），不触碰窗口交换链。
+    pub fn render_export(&mut self) {
+        let (block_count, line_count, note_draws) = self.prepare_frame();
+        self.ensure_export();
+        let (tex, view) = self.export_rt.clone().unwrap();
+        let [w, h] = self.export_size;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("export") });
+        self.encode_scene(&mut encoder, &view, block_count, line_count, &note_draws);
+        encoder.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: self.export_buffer.as_ref().unwrap(),
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.export_padded_bytes_per_row), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// 读取上一帧 `render_export` 的结果，返回紧密排列的 BGRA 像素（去除行对齐填充）。
+    pub fn read_export(&mut self) -> Vec<u8> {
+        let buffer = self.export_buffer.as_ref().unwrap();
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = rx.recv();
+        let (w, h) = (self.export_size[0] as usize, self.export_size[1] as usize);
+        let padded = self.export_padded_bytes_per_row as usize;
+        let mut out = vec![0u8; w * h * 4];
+        {
+            let data = slice.get_mapped_range().unwrap();
+            for row in 0..h {
+                out[row * w * 4..(row + 1) * w * 4].copy_from_slice(&data[row * padded..row * padded + w * 4]);
+            }
+        }
+        buffer.unmap();
+        out
+    }
+
+    /// 确保离屏导出纹理/回读缓冲与当前尺寸一致。
+    fn ensure_export(&mut self) {
+        let (w, h) = ((self.render_size[0] as u32).max(1), (self.render_size[1] as u32).max(1));
+        if self.export_rt.is_some() && self.export_size == [w, h] { return; }
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("export"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: self.config.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let padded = ((w * 4 + wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1) / wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export readback"), size: padded as u64 * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        self.export_rt = Some((tex, view));
+        self.export_buffer = Some(buffer);
+        self.export_padded_bytes_per_row = padded;
+        self.export_size = [w, h];
+    }
+
+    /// 导出期间在窗口上显示进度。直接以窗口尺寸绘制，避免被拉伸。
+    pub fn present_progress(&mut self, title: &str, lines: &[String], pct: f32) {
+        self.text_vertices.clear();
+        // 临时切到「窗口尺寸、1:1」的坐标系来排版进度。
+        let saved = (self.render_size, self.design, self.fit, self.origin, self.y_up, self.render_scale);
+        let (w, h) = (self.size[0], self.size[1]);
+        self.render_size = [w, h];
+        self.design = [w, h];
+        self.fit = Fit::Stretch;
+        self.origin = [w / 2.0, h / 2.0];
+        self.y_up = true;
+        self.render_scale = 1.0;
+
+        let fg = [0.92, 0.92, 0.92, 1.0];
+        let green = [0.30, 0.85, 0.42, 1.0]; // 绿色进度填充
+        let p = pct.clamp(0.0, 1.0);
+        let s = (w / 960.0).min(h / 540.0).max(0.6);
+        let px = 40.0 * s;
+
+        // 全部文本同一字号、同一颜色（不区分标题/正文）。
+        let mut items: Vec<String> = Vec::with_capacity(lines.len() + 2);
+        items.push(title.to_string());
+        items.extend(lines.iter().cloned());
+        items.push(format!("{:.1}%", p * 100.0));
+        let mut y = h / 2.0 - 46.0 * s;
+        for it in &items {
+            let tw = self.measure_text(it, px);
+            self.draw_text(it, -tw / 2.0, y, px, fg);
+            y -= px * 1.6;
+        }
+
+        // 进度条：白色边框 + 深槽 + 绿色填充。
+        let bw = w * 0.86;
+        let bh = 40.0 * s;
+        let bx = -bw / 2.0;
+        let by = -h / 2.0 + 92.0 * s;
+        self.draw_rect([0.0, by], [bw + 8.0 * s, bh + 8.0 * s], [0.95, 0.95, 0.95, 1.0]);
+        self.draw_rect([0.0, by], [bw, bh], [0.06, 0.07, 0.07, 1.0]);
+        if p > 0.0 {
+            self.draw_rect([bx + bw * p / 2.0, by], [bw * p, bh], green);
+        }
+        self.upload_text();
+        // 还原渲染坐标系。
+        (self.render_size, self.design, self.fit, self.origin, self.y_up, self.render_scale) = saved;
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => { self.surface.configure(&self.device, &self.config); return; }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return,
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("progress") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("progress"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.04, g: 0.05, b: 0.07, a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                ..Default::default()
+            });
+            if !self.text_vertices.is_empty() {
+                pass.set_pipeline(&self.text_pipeline);
+                pass.set_bind_group(0, &self.text_bg, &[]);
+                pass.set_vertex_buffer(0, self.text_buffer.slice(..));
+                pass.draw(0..self.text_vertices.len() as u32, 0..1);
+            }
+        }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
     }

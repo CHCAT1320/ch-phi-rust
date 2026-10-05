@@ -29,9 +29,9 @@ pub fn render(renderer: &mut Renderer, blocks: &[BlockArea], time: f32, shader_t
     // 供块着色器做位移/呼吸动画（对应 Unity `_Time.x/.y`）
     renderer.set_time(shader_time);
 
-    // 用窗口像素尺寸作为「视口世界尺寸」，这样 AnchorToWorld 直接得到
+    // 用渲染像素尺寸作为「视口世界尺寸」，这样 AnchorToWorld 直接得到
     // 与渲染器一致的像素坐标（原点居中、y 向上）。
-    let screen = renderer.window_size();
+    let screen = renderer.render_size();
 
     for block in blocks {
         // 隐藏阶段：出现前 / 消失后

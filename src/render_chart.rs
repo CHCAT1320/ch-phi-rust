@@ -85,7 +85,7 @@ impl TimeEvent for DisappearEvent {
 ///
 /// `time` 为音乐播放时间（秒），内部用 `chart.offset` 校正为谱面时间。
 pub fn render(renderer: &mut Renderer, chart: &Chart, runtime: &mut ChartRuntime, time: f32) {
-    let size = renderer.window_size();
+    let size = renderer.render_size();
     let (w, h) = (size[0], size[1]);
     let chart_time = time - chart.offset;
     // 判定线长度 = 窗口宽度的 3 倍（与参考实现 `game.html` 的 `3×LW` 一致）。
@@ -235,16 +235,16 @@ pub struct ChartRuntime {
     /// 当前正在持续的 Hold（周期性生成打击特效）。
     active_holds: Vec<ActiveHold>,
     hits: Vec<ActiveHit>,
-    /// 打击音效：`[tap, drag, flick]`。
-    sfx: [Sfx; 3],
+    /// 打击音效：`[tap, drag, flick]`；导出模式（`--recorder`）为 `None`（不实时播放）。
+    sfx: Option<[Sfx; 3]>,
     /// 简易 LCG，用于生成小方块的随机方向。
     rng: u32,
     /// 总音符数（用于计分）。
     note_count: usize,
     /// 连击数。
     combo: u32,
-    /// 当前分数（满分 1000000）。
-    score: f32,
+    /// 当前分数（满分 1000000）。用 f64 累加，避免 2026 次相加的 f32 精度误差。
+    score: f64,
     /// 音乐总时长（秒），用于进度条。
     music_len: f32,
 }
@@ -252,6 +252,15 @@ pub struct ChartRuntime {
 impl ChartRuntime {
     /// 构建运行时：收集所有音符的打击事件（按时间排序），并接收已加载的打击音效与音乐时长。
     pub fn new(chart: &Chart, sfx_tap: Sfx, sfx_drag: Sfx, sfx_flick: Sfx, music_len: f32) -> Self {
+        Self::build(chart, Some([sfx_tap, sfx_drag, sfx_flick]), music_len)
+    }
+
+    /// 导出模式（`--recorder`）：不实时播放打击音效（音效由 ffmpeg 与音乐混合）。
+    pub fn new_silent(chart: &Chart, music_len: f32) -> Self {
+        Self::build(chart, None, music_len)
+    }
+
+    fn build(chart: &Chart, sfx: Option<[Sfx; 3]>, music_len: f32) -> Self {
         let mut events = Vec::new();
         let mut holds = Vec::new();
         let mut note_count = 0usize;
@@ -293,13 +302,25 @@ impl ChartRuntime {
             hold_cursor: 0,
             active_holds: Vec::new(),
             hits: Vec::new(),
-            sfx: [sfx_tap, sfx_drag, sfx_flick],
+            sfx,
             rng: 0x1234_5678,
             note_count,
             combo: 0,
             score: 0.0,
             music_len,
         }
+    }
+
+    /// 供导出混音使用：全部打击音效事件 `(谱面秒, 音效索引 0=tap / 1=drag / 2=flick)`。
+    pub fn sfx_times(&self) -> Vec<(f32, usize)> {
+        let mut out: Vec<(f32, usize)> = Vec::with_capacity(self.events.len() + self.holds.len());
+        for e in &self.events {
+            let idx = match e.note_type { 2 => SFX_DRAG, 4 => SFX_FLICK, _ => SFX_TAP };
+            out.push((e.time, idx));
+        }
+        for h in &self.holds { out.push((h.time, SFX_TAP)); }
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     /// 简易 LCG 随机数（0..1）。
@@ -312,7 +333,7 @@ impl ChartRuntime {
     fn hit_score(&mut self) {
         self.combo += 1;
         if self.note_count > 0 {
-            self.score += 1_000_000.0 / self.note_count as f32;
+            self.score += 1_000_000.0 / self.note_count as f64;
         }
     }
 
@@ -347,7 +368,7 @@ impl ChartRuntime {
                 4 => SFX_FLICK,
                 _ => SFX_TAP,
             };
-            let _ = self.sfx[idx].play(PlaySfxParams::default());
+            if let Some(sfx) = &mut self.sfx { let _ = sfx[idx].play(PlaySfxParams::default()); }
             self.hit_score();
             self.cursor += 1;
         }
@@ -355,7 +376,7 @@ impl ChartRuntime {
         // Hold 头：播放一次音效，并登记其周期性打击（首次在头部时刻触发）。
         while self.hold_cursor < self.holds.len() && self.holds[self.hold_cursor].time <= chart_time {
             let event = self.holds[self.hold_cursor];
-            let _ = self.sfx[SFX_TAP].play(PlaySfxParams::default());
+            if let Some(sfx) = &mut self.sfx { let _ = sfx[SFX_TAP].play(PlaySfxParams::default()); }
             self.active_holds.push(ActiveHold { next: event.time, event, counted: false });
             self.hold_cursor += 1;
         }
@@ -437,7 +458,7 @@ impl ChartRuntime {
 
     /// 绘制 HUD（参考 CHCAT `rpe.js`：暂停图标、进度线、水印、连击、分数）。
     fn draw_hud(&self, renderer: &mut Renderer, chart_time: f32) {
-        let size = renderer.window_size();
+        let size = renderer.render_size();
         let (w, h) = (size[0], size[1]);
         // 参考画布为 720×540，按 contain 比例缩放，保证与实际画面比例一致。
         let s = (w / 720.0).min(h / 540.0);
@@ -458,7 +479,7 @@ impl ChartRuntime {
         }
 
         // 水印：右下角，12px（项目名 + 版本号）。
-        let watermark = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
+        let watermark = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"), "all code by CHCAT1320");
         let wm_px = 12.0 * s;
         let wm_w = renderer.measure_text(watermark, wm_px);
         renderer.draw_text(watermark, w / 2.0 - wm_w - 10.0 * s, -h / 2.0 + 5.0 * s, wm_px, white);
@@ -484,7 +505,7 @@ impl ChartRuntime {
 
 /// 分数显示文本（移植 CHCAT `getScoreText`）：
 /// `score += 0.5` 后取整；`>= 1e6` 显示 `1000000`，否则 `0` + `(score/1e5)` 的 5 位小数拼接。
-fn score_to_text(score: f32) -> String {
+fn score_to_text(score: f64) -> String {
     let s = (score + 0.5).floor().max(0.0) as i64;
     if s >= 1_000_000 {
         "1000000".to_string()
