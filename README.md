@@ -23,7 +23,8 @@
 
 - **Rust**：edition 2024（建议 stable ≥ 1.85）。
 - **ffmpeg**：仅 `--recorder` 导出需要。放运行目录（`ffmpeg.exe`），或用 `--ffmpeg` 指定。
-- 运行平台：Windows / Linux / macOS（CI 构建见 [发布](#发布)）。
+- 运行平台：Windows x86_64 / Linux x86_64 / macOS **universal**（arm64 + x86_64，
+  兼容 Apple Silicon 与 Intel）；CI 构建见 [发布](#发布)。
   Windows 发布版为纯 GUI 程序（无控制台窗口）。
 
 `assets/` 下除 `charts/` 外的资源都会在编译期由 `build.rs` 内嵌进二进制；
@@ -111,8 +112,13 @@ build.rs            # 把 assets/（除 charts/）内嵌进二进制
 
 ## 发布
 
-`.github/workflows/release.yml`：push `v*` 标签（或在 Actions 手动触发并填 `tag`）后，
-在 Windows / Linux / macOS 上构建 release，并创建一个 **草稿（draft）** Release，上传各平台压缩包。
+`.github/workflows/release.yml`：
+
+- 推送到 `master`/`main` 只跑 **build**（CI）。
+- push `v*` 标签（或在 Actions 手动触发并填 `tag`）时构建并创建一个 **草稿（draft）** Release。
+
+产物：`ch-phi-rust-windows-x86_64.zip`、`ch-phi-rust-linux-x86_64.tar.gz`、
+`ch-phi-rust-macos-universal.tar.gz`（macOS 用 `lipo` 合成的 arm64 + x86_64 通用二进制）。
 
 ```bash
 git tag v0.1.0

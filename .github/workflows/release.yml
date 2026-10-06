@@ -36,10 +36,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: ch-phi-rust
             asset: ch-phi-rust-linux-x86_64.tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bin: ch-phi-rust
-            asset: ch-phi-rust-macos-aarch64.tar.gz
     steps:
       - uses: actions/checkout@v4
 
@@ -74,8 +70,8 @@ jobs:
           -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}"
           -DestinationPath "${{ matrix.asset }}"
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         run: >
           tar -czf "${{ matrix.asset }}"
           -C "target/${{ matrix.target }}/release"
@@ -88,9 +84,50 @@ jobs:
           path: ${{ matrix.asset }}
           if-no-files-found: error
 
+  # macOS：分别构建 arm64 与 x86_64，再用 lipo 合成 universal2 单包，兼容 Intel 与 Apple Silicon。
+  macos:
+    name: Build (macos-universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build (arm64)
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Build (x86_64)
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/ch-phi-rust \
+            target/x86_64-apple-darwin/release/ch-phi-rust \
+            -output ch-phi-rust
+          lipo -info ch-phi-rust
+
+      - name: Package
+        run: tar -czf ch-phi-rust-macos-universal.tar.gz ch-phi-rust
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch-phi-rust-macos-universal.tar.gz
+          path: ch-phi-rust-macos-universal.tar.gz
+          if-no-files-found: error
+
   release:
     name: Draft release
-    needs: build
+    needs: [build, macos]
     # 分支推送只做构建（CI）；仅 tag 推送或手动触发才开草稿 Release。
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
