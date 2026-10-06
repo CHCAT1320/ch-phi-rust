@@ -1,2 +1,5 @@
 /target
 /assets/charts
+# 运行期依赖，体积大，不入库（放运行目录即可）
+/ffmpeg.exe
+/ffmpeg
