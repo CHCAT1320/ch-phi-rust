@@ -123,7 +123,7 @@ git push origin v0.1.0
 
 - 音乐、插画与谱面**不在仓库内**（`assets/charts/` 已在 `.gitignore` 中排除），请自行放入。
 - 其余内嵌素材（音符、打击特效、打击音效、UI、图标等）源自 **Phigros**，
-  版权归 **Phigros 官方（Pigeon Games / 鸽游）** 及相应原作者所有；
+  版权归 **Phigros 官方（Pigeon Games / 鸽游 / 南京鸽游网络有限公司）** 及相应原作者所有；
   此处仅用于学习/研究，请勿用于任何商业用途。
 - 本项目为民间非官方作品，与 Pigeon Games 无关联。
 
