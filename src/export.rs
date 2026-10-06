@@ -79,6 +79,7 @@ pub fn run(
     output: Option<String>,
     ffmpeg_arg: Option<PathBuf>,
     max_frames: Option<usize>,
+    random_sfx: bool,
 ) {
     let ffmpeg = match ffmpeg_arg {
         Some(p) if p.is_file() => p,
@@ -100,8 +101,9 @@ pub fn run(
     }
     println!("导出：谱面={chart_path} 音乐={music_path} 时长={music_len:.2}s FPS={FPS} 缩放={:.2}", scale.unwrap_or(1.0));
 
-    let runtime = render_chart::ChartRuntime::new_silent(&chart, music_len);
-    let sfx_wav = match generate_sfx_wav(&runtime.sfx_times(), music_len) {
+    let sfx_mode = if random_sfx { render_chart::SfxMode::Random } else { render_chart::SfxMode::Default };
+    let runtime = render_chart::ChartRuntime::new_silent(&chart, sfx_mode, music_len);
+    let sfx_wav = match generate_sfx_wav(&runtime.sfx_times(), music_len, sfx_mode) {
         Ok(p) => p,
         Err(e) => { eprintln!("生成打击音效轨失败：{e}"); return; }
     };
@@ -412,7 +414,11 @@ fn decode_wav(bytes: &[u8]) -> Clip {
         stereo.push(l);
         stereo.push(r);
     }
-    // 重采样到 SFX_RATE
+    resample_to_sfx(stereo, rate, n)
+}
+
+/// 把交错立体声从 `rate` 重采样到 [`SFX_RATE`]。
+fn resample_to_sfx(stereo: Vec<f32>, rate: u32, n: usize) -> Clip {
     if rate == SFX_RATE || n == 0 {
         return Clip { data: stereo };
     }
@@ -432,26 +438,53 @@ fn decode_wav(bytes: &[u8]) -> Clip {
     Clip { data: out }
 }
 
+/// 解码一段内嵌音频（wav 自解；mp3/aac 等交给 `sasa` 的 symphonia 解码），
+/// 输出交错立体声 f32 并重采样到 [`SFX_RATE`]。
+fn decode_audio(key: &str) -> Clip {
+    let bytes = crate::embedded::expect(key);
+    if key.ends_with(".wav") {
+        return decode_wav(bytes);
+    }
+    let (frames, rate) = sasa::AudioClip::decode(bytes.to_vec())
+        .unwrap_or_else(|e| panic!("解码打击音效 {key} 失败: {e}"));
+    let n = frames.len();
+    let mut stereo = Vec::with_capacity(n * 2);
+    for f in &frames {
+        stereo.push(f.0);
+        stereo.push(f.1);
+    }
+    resample_to_sfx(stereo, rate, n)
+}
+
 /// 把打击音效按事件时间铺成一条与音乐等长的立体声轨，写入临时 f32 wav。
-fn generate_sfx_wav(events: &[(f32, usize)], music_len: f32) -> std::io::Result<PathBuf> {
-    let clips = [
-        decode_wav(crate::embedded::expect("audio/tap.wav")),
-        decode_wav(crate::embedded::expect("audio/drag.wav")),
-        decode_wav(crate::embedded::expect("audio/flick.wav")),
-    ];
+fn generate_sfx_wav(events: &[(f32, usize)], music_len: f32, mode: render_chart::SfxMode) -> std::io::Result<PathBuf> {
+    let clips: Vec<Clip> = match mode {
+        render_chart::SfxMode::Default => vec![
+            decode_wav(crate::embedded::expect("audio/tap.wav")),
+            decode_wav(crate::embedded::expect("audio/drag.wav")),
+            decode_wav(crate::embedded::expect("audio/flick.wav")),
+        ],
+        render_chart::SfxMode::Random => {
+            let keys = render_chart::random_sfx_keys();
+            println!("随机打击音效：{} 个音频（audio/idk/）", keys.len());
+            keys.iter().map(|k| decode_audio(k)).collect()
+        }
+    };
     let total_frames = ((music_len * SFX_RATE as f32).ceil() as usize) + SFX_RATE as usize; // 多留 1s
     let mut buf = vec![0f32; total_frames * 2];
     let mut placed = 0usize;
-    for &(t, kind) in events {
-        let clip = &clips[kind.min(2)];
-        let start = (t.max(0.0) * SFX_RATE as f32).round() as usize;
-        for i in 0..clip.frames() {
-            let d = (start + i) * 2;
-            if d + 1 >= buf.len() { break; }
-            buf[d] += clip.data[i * 2];
-            buf[d + 1] += clip.data[i * 2 + 1];
+    if !clips.is_empty() {
+        for &(t, kind) in events {
+            let clip = &clips[kind.min(clips.len() - 1)];
+            let start = (t.max(0.0) * SFX_RATE as f32).round() as usize;
+            for i in 0..clip.frames() {
+                let d = (start + i) * 2;
+                if d + 1 >= buf.len() { break; }
+                buf[d] += clip.data[i * 2];
+                buf[d + 1] += clip.data[i * 2 + 1];
+            }
+            placed += 1;
         }
-        placed += 1;
     }
     println!("打击音效：{} 个事件，已混入音轨。", placed);
     let path = std::env::temp_dir().join("ch_phi_sfx_track.wav");

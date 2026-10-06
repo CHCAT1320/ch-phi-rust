@@ -26,10 +26,20 @@ const BLOCK_SPARK_KEY: &str = "block/PointNoise.png";
 const MASK_DOWNSCALE: u32 = 2;
 /// 边缘/辉光 RT 相对屏幕的降采样（文档为 4，同步提高）。
 const EFFECT_DOWNSCALE: u32 = 2;
-/// 块系统 RT 格式（`render.md`：块遮罩 fmt16、disabled/ready/composedDisabled/effect/ping fmt25）。
-/// 这些 RT 需要容纳 >1 的值（subtract 归属 `v∈[0,2]`、覆盖度 `ds.y∈[0,20]`、辉光累积），
-/// 以及块边缘/辉光的连续渐变，因此用 16F 而非 8bit UNORM（后者会截断并产生台阶）。
-const BLOCK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// `RenderTextureFormat` 16 = `R8`：单通道 8bit UNorm。
+/// 用于 `normalBlockRT` / `subtractBlockRT` / `composedEnabledBlockRT` / `touchBlockRT`。
+/// （`sceneColorRT` 例外，见下。）
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+/// `RenderTextureFormat` 25 = `RG16`（= `R8G8`）：双通道 8bit UNorm。
+/// 用于 `disabled*BlockRT` / `composedDisabledBlockRT` / `effectRT` / `pingA`/`pingB`。
+///
+/// 与 Unity 一致：1/2 通道 8bit UNorm 会把 >1 的中间值钳到 1、丢弃 alpha，
+/// 因此 `SubtractBlockBlender` 的 `v∈[0,2]`、覆盖度 `ds.y` 等都会在写入时归一到 `[0,1]`。
+///
+/// 注意：`sceneColorRT` 虽在反汇编里也是 fmt16，但 ActiveBlock 的 `_SceneColor` 需要
+/// **RGB** 才能让块体呈现被覆盖内容/UI 的颜色（HSV 偏移），单通道会退化成 `(r,0,0)`，
+/// 因此这里 `rt_scene` 仍用 `config.format`（全彩）。
+const MASK2_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
 /// MSAA 采样数：块遮罩光栅化 与 场景（背景/线/Disabled）都用 4×，随后 resolve。
 const MSAA_SAMPLES: u32 = 4;
 
@@ -191,6 +201,12 @@ impl NoteTexture {
 /// 音符贴图数量（索引与 [`NoteTexture`] 对应）。
 const NOTE_TEXTURE_COUNT: usize = 11;
 
+/// 打击特效图集：`hit/hit.png`，一行 6 帧、共 5 行（= 30 帧），每格等分。
+const HIT_ATLAS_KEY: &str = "hit/hit.png";
+const HIT_ATLAS_COLS: usize = 6;
+const HIT_ATLAS_ROWS: usize = 5;
+const HIT_FRAME_COUNT: usize = HIT_ATLAS_COLS * HIT_ATLAS_ROWS;
+
 /// 音符贴图文件（`HL` 为高亮版本）；键为相对 `assets/` 的路径。
 const NOTE_TEXTURE_PATHS: [&str; NOTE_TEXTURE_COUNT] = [
     "notes/Tap2.png",
@@ -218,6 +234,8 @@ struct NoteSprite {
     color: [f32; 4],
     /// 横向 UV 范围（裁剪贴图左右透明留白）。
     uv_x: [f32; 2],
+    /// 纵向 UV 范围（默认 `[0,1]`；打击特效图集按帧裁剪）。
+    uv_y: [f32; 2],
     transform: Affine2,
     /// 绘制层：`0` = Hold（位于所有note最下面）、`1` = 普通note、`2` = 打击特效。
     layer: u8,
@@ -377,6 +395,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
     let dn = textureSample(dn_tex, samp, in.uv).x;
     let ds = textureSample(ds_tex, samp, in.uv).xy;
     let t = ds.x * ds.y - dn;
+    // 目标为 RG16（R8G8）：只写 `.x`/`.y`，alpha 被丢弃（与原版一致）。
     return vec4<f32>(abs(t), ds.y, 0.0, 1.0);
 }}"
     )
@@ -483,7 +502,57 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
     let disp = dir * (a1 - 0.5) + vec2<f32>(-dir.y, dir.x) * (a2 - 0.5);
     let spark = textureSample(spark_tex, spark_samp, disp * u.dis_params.y + in.uv * u.st_spark.xy).x;
     let col = spark * u.dis_spark.rgb * avg * u.dis_spark.w + u.dis_fill.rgb * u.dis_fill.w;
+    // 原版 DisabledBlock 写入 RG16（R8G8）遮罩，`SV_Target0.w = vs_COLOR0.w` 会被丢弃；
+    // 这里直接合成到 `scene_full`，alpha 写 1.0。
     return vec4<f32>(comp * col, 1.0);
+}}"
+    )
+}
+
+/// `Unlit/ReadyBlock`：独立的预备态呼吸 pass。
+///
+/// 读纯预备遮罩（`ready_n.x` / `ready_s.y`）与 `_ComposeRT`（= `rt_composed_disabled`），
+/// 完全在块外时 `discard`，否则输出 `vec4(a·pulse·_ShineColor·_ShineBrightness, a)`，
+/// 其中 `a = _ComposeRT.x · |ready_s.y − ready_n.x|`（对应原版 ReadyBlock 的呼吸脉冲）。
+fn ready_shader() -> String {
+    format!(
+        "{U_STRUCT}
+@group(0) @binding(1) var ready_n_tex: texture_2d<f32>;
+@group(0) @binding(2) var ready_s_tex: texture_2d<f32>;
+@group(0) @binding(3) var compose_tex: texture_2d<f32>;
+@group(0) @binding(4) var samp: sampler;
+{FULLSCREEN_VS}
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
+    let dn = textureSample(ready_n_tex, samp, in.uv).x;
+    let ds = textureSample(ready_s_tex, samp, in.uv).y;
+    let c = textureSample(compose_tex, samp, in.uv).x;
+    let m = ds - dn;
+    let a = c * abs(m);
+    if (a - 1e-4 < 0.0) {{ discard; }}
+    let pulse = sin(u.params.x * u.spark2.z) * 0.5 + 1.0;   // sin(_Time.y·_ShineSpeed)·0.5+1
+    let tint = vec3<f32>(1.0) * u.spark2.w;                 // _ShineColor(白)·_ShineBrightness
+    return vec4<f32>(vec3<f32>(a) * pulse * tint, a);
+}}"
+    )
+}
+
+/// `SubtractBlockPostProcessor` 的等价物：把生效减块从场景色中扣除（挖洞）。
+///
+/// 原版 3 个后处理器挂在相机上，在 `targetPass 0/1` 处用 `subtractBlockMaterial`
+/// 对场景色与减块遮罩做扣除。此处等价为在 `scene_full → sceneColorRT` 拷贝时，
+/// 用 `rt_subtract`（生效减块归属 `v`）衰减场景色，供 active 的 `_SceneColor` 使用。
+fn scene_shader() -> String {
+    format!(
+        "@group(0) @binding(0) var scene_tex: texture_2d<f32>;
+@group(0) @binding(1) var subtract_tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+{FULLSCREEN_VS}
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
+    let c = textureSample(scene_tex, samp, in.uv);
+    let s = clamp(textureSample(subtract_tex, samp, in.uv).x, 0.0, 1.0);
+    return vec4<f32>(c.rgb * (1.0 - s), c.a);
 }}"
     )
 }
@@ -509,6 +578,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
     let st = lo + hi;
     let k = clamp((t.y - 0.2) * -10.0, 0.0, 1.0);
     let v = (k * -2.0 + 3.0) * (k * k) + st;
+    // 目标为 R8 或 RG16（R8G8）：`.x`=归属、`.y`=覆盖度，alpha 被丢弃。
     return vec4<f32>(v, t.y * v * 10.0, 0.0, 1.0);
 }}"
     )
@@ -519,16 +589,14 @@ fn active_shader() -> String {
         "{U_STRUCT}
 @group(0) @binding(1) var compose_tex: texture_2d<f32>;
 @group(0) @binding(2) var effect_tex: texture_2d<f32>;
-@group(0) @binding(3) var ready_n_tex: texture_2d<f32>;
-@group(0) @binding(4) var ready_s_tex: texture_2d<f32>;
-@group(0) @binding(5) var ready_compose_tex: texture_2d<f32>;
-@group(0) @binding(6) var disp_tex: texture_2d<f32>;
-@group(0) @binding(7) var spark_tex: texture_2d<f32>;
-@group(0) @binding(8) var samp: sampler;
-@group(0) @binding(9) var disp_samp: sampler;
-@group(0) @binding(10) var spark_samp: sampler;
-@group(0) @binding(11) var scene_tex: texture_2d<f32>;
-@group(0) @binding(12) var effect_samp: sampler;
+@group(0) @binding(3) var ready_tex: texture_2d<f32>;
+@group(0) @binding(4) var disp_tex: texture_2d<f32>;
+@group(0) @binding(5) var spark_tex: texture_2d<f32>;
+@group(0) @binding(6) var samp: sampler;
+@group(0) @binding(7) var disp_samp: sampler;
+@group(0) @binding(8) var spark_samp: sampler;
+@group(0) @binding(9) var scene_tex: texture_2d<f32>;
+@group(0) @binding(10) var effect_samp: sampler;
 {FULLSCREEN_VS}
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
@@ -540,14 +608,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
     let ep = (floor(in.uv * u.texel.zw) + 0.5) * u.texel.xy;
     let edge = textureSample(effect_tex, effect_samp, ep).x;
     let glow = textureSample(effect_tex, effect_samp, in.uv).y;
-    let dn = textureSample(ready_n_tex, samp, in.uv).x;
-    let ds = textureSample(ready_s_tex, samp, in.uv).y;
-    let ready = textureSample(ready_compose_tex, samp, in.uv).x;
-    let m = ds - dn;
-    let rd = ready * abs(m);
+    // 预备态呼吸由独立的 `Unlit/ReadyBlock` pass 预计算（rt_ready_out，RG16）。
+    // `_ShineColor` 为白色，故 `.x`/`.y` 即三通道同值的呼吸亮度（`.b` 不存在，写 0）。
+    let ready = textureSample(ready_tex, samp, in.uv);
+    let rd = ready.x;
     let sum_enabled = edge + comp;
     let total50 = glow + sum_enabled;
-    let total = abs(m) * ready + total50;
+    let total = rd + total50;
     if (total - 1e-4 < 0.0) {{ discard; }}
 
     var rgb = vec3<f32>(0.0);
@@ -598,13 +665,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
         alpha = glow_term + comp * u.fill.w + edge_term;
     }}
 
-    // 预备态呼吸：_ShineColor(白) × _ShineBrightness × (sin(_Time.y×_ShineSpeed)×0.5+1)，覆盖度乘两次
-    var ready_rgb = vec3<f32>(0.0);
-    if (rd > 1e-4) {{
-        let pulse = sin(u.params.x * u.spark2.z) * 0.5 + 1.0;
-        ready_rgb = vec3<f32>(1.0) * u.spark2.w * pulse * rd * rd;
-    }}
-    return vec4<f32>(rgb + ready_rgb, alpha);
+    // 预备态呼吸由 ReadyBlock pass 写入 rt_ready_out 的 `.x`（含 pulse × _ShineBrightness）；
+    // `_ShineColor` 为白，三通道同值。原版只在 rgb 上叠加、不加 alpha。
+    return vec4<f32>(rgb + vec3<f32>(ready.x), alpha);
 }}"
     )
 }
@@ -643,14 +706,18 @@ pub struct Renderer {
     vertex_capacity: usize,
 
     sprite_pipeline: wgpu::RenderPipeline,
+    sprite_pipeline_rg8: wgpu::RenderPipeline,
     compose1_pipeline: wgpu::RenderPipeline,
     compose2_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
     glow_pipeline: wgpu::RenderPipeline,
     glow_final_pipeline: wgpu::RenderPipeline,
     subtract_pipeline: wgpu::RenderPipeline,
+    subtract_pipeline_rg8: wgpu::RenderPipeline,
     disabled_pipeline: wgpu::RenderPipeline,
+    ready_pipeline: wgpu::RenderPipeline,
     active_pipeline: wgpu::RenderPipeline,
+    scene_pipeline: wgpu::RenderPipeline,
     copy_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
 
@@ -661,7 +728,9 @@ pub struct Renderer {
     glow_bgs: Vec<wgpu::BindGroup>,
     glow_final_bg: wgpu::BindGroup,
     disabled_bg: wgpu::BindGroup,
+    ready_bg: wgpu::BindGroup,
     active_bg: wgpu::BindGroup,
+    scene_bg: wgpu::BindGroup,
     copy_bg: wgpu::BindGroup,
     bg_bg: wgpu::BindGroup,
     overlay_bg_a: wgpu::BindGroup,
@@ -684,6 +753,7 @@ pub struct Renderer {
     rt_disabled_subtract: (wgpu::Texture, wgpu::TextureView),
     rt_ready_normal: (wgpu::Texture, wgpu::TextureView),
     rt_ready_subtract: (wgpu::Texture, wgpu::TextureView),
+    rt_ready_out: (wgpu::Texture, wgpu::TextureView),
     rt_composed_enabled: (wgpu::Texture, wgpu::TextureView),
     rt_composed_disabled: (wgpu::Texture, wgpu::TextureView),
     rt_effect: (wgpu::Texture, wgpu::TextureView),
@@ -746,6 +816,10 @@ pub struct Renderer {
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
     text_vertices: Vec<NoteVertex>,
+    /// 最上层文本（水印）：在 active 块合成之后绘制，不受块影响。
+    top_text_buffer: wgpu::Buffer,
+    top_text_capacity: usize,
+    top_text_vertices: Vec<NoteVertex>,
 
     /// 视频导出的离屏渲染目标（`RENDER_ATTACHMENT | COPY_SRC`）。
     export_rt: Option<(wgpu::Texture, wgpu::TextureView)>,
@@ -778,6 +852,13 @@ impl Renderer {
         let vertex_buffer = create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY);
         let block_vertex_buffer = create_block_vertex_buffer(&device, INITIAL_BLOCK_CAPACITY);
 
+        // 贴图 colorSpace（`materials.md` §1）：`Block`(16)/`BlockNoise1`(30) 标记为 sRGB，
+        // `PointNoise`(17) 为 Linear。但本渲染器整体工作在 **Gamma 空间**（非 sRGB 目标、材质色
+        // 即显示值），此时 sRGB 贴图**不**做 sRGB→线性转换，故这里统一按线性加载。
+        //
+        // 若把 `BlockNoise1` 改成 `Rgba8UnormSrgb`，线性化会使其均值从 ~0.5 降到 ~0.2，
+        // 而 `compose1` 用 `(noise-0.5)·_DisplaceStrength` 位移块遮罩 → 会把整个红区推移几个
+        // 百分点。要正确线性化，必须同时把整条管线切到 Linear（sRGB 目标 + 输出编码）。
         let mask_tex = load_texture(&device, &queue, BLOCK_MASK_KEY, false);
         let disp_tex = load_texture(&device, &queue, BLOCK_DISPLACE_KEY, false);
         let spark_tex = load_texture(&device, &queue, BLOCK_SPARK_KEY, false);
@@ -825,16 +906,14 @@ impl Renderer {
             note_tex_blue[i] = t.blue_width;
             note_bind_groups.push(bg_note(&device, &note_bgl, &t.view, &note_sampler));
         }
-        // 打击特效帧（内嵌 `hit/img-N.png`），索引紧跟在音符贴图之后；统一染成金色。
-        let mut hit_frame_count = 0usize;
-        for i in 1..=64 {
-            let key = format!("hit/img-{i}.png");
-            if crate::embedded::get(&key).is_none() { break; }
-            let t = load_texture_tinted(&device, &queue, &key, false, Some([255, 236, 160]));
+        // 打击特效图集（内嵌 `hit/hit.png`，一行 `HIT_ATLAS_COLS` 帧 × `HIT_ATLAS_ROWS` 行），
+        // 索引紧跟在音符贴图之后；统一染成金色，各帧通过 `NoteSprite::uv_x/uv_y` 裁剪。
+        let hit_frame_count = HIT_FRAME_COUNT;
+        {
+            let t = load_texture_tinted(&device, &queue, HIT_ATLAS_KEY, false, Some([255, 236, 160]));
             note_bind_groups.push(bg_note(&device, &note_bgl, &t.view, &note_sampler));
-            hit_frame_count += 1;
         }
-        // 打击特效的小方块：纯白贴图，绘制时用顶点色染成金色。
+        // 打击特效的小方块：纯白贴图，绘制时用顶点色染成金色（索引 = 音符贴图数 + 1）。
         let spark_view = solid_texture(&device, &queue, [255, 255, 255, 255]);
         note_bind_groups.push(bg_note(&device, &note_bgl, &spark_view, &note_sampler));
         let note_pipeline = build_note_pipeline(&device, config.format, MSAA_SAMPLES, &note_bgl);
@@ -899,6 +978,7 @@ impl Renderer {
         let text_bg = bg_note(&device, &note_bgl, &text_atlas_view, &text_sampler);
         let text_pipeline = build_note_pipeline(&device, config.format, 1, &note_bgl);
         let text_buffer = create_note_vertex_buffer(&device, INITIAL_NOTE_CAPACITY);
+        let top_text_buffer = create_note_vertex_buffer(&device, INITIAL_NOTE_CAPACITY);
 
         let all = wgpu::ColorWrites::ALL;
         // Unlit/BlockSprite 固定状态：Blend SrcAlpha, One（加性）
@@ -906,15 +986,21 @@ impl Renderer {
             color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
             alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
         };
-        let sprite_pipeline = build_fullscreen(&device, "sprite", &sprite_shader(), "fs_main", BLOCK_FORMAT, &create_sprite_bgl(&device), sprite_blend, true, all, MSAA_SAMPLES);
-        let compose1_pipeline = build_fullscreen(&device, "compose1", &compose1_shader(), "fs_main", BLOCK_FORMAT, &create_compose1_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let compose2_pipeline = build_fullscreen(&device, "compose2", &compose2_shader(), "fs_main", BLOCK_FORMAT, &create_compose2_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let edge_pipeline = build_fullscreen(&device, "edge", &edge_shader(), "fs_main", BLOCK_FORMAT, &create_edge_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let glow_pipeline = build_fullscreen(&device, "glow", &glow_shader(), "fs_main", BLOCK_FORMAT, &create_glow_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let glow_final_pipeline = build_fullscreen(&device, "glow_final", &glow_final_shader(), "fs_main", BLOCK_FORMAT, &create_glow_final_bgl(&device), wgpu::BlendState::REPLACE, false, wgpu::ColorWrites::GREEN, 1);
-        let subtract_pipeline = build_fullscreen(&device, "subtract_blender", &subtract_blender_shader(), "fs_main", BLOCK_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
+        // 遮罩 RT 分两种格式：fmt16=R8Unorm（单通道）、fmt25=Rg8Unorm（双通道）；
+        // wgpu 管线与目标格式绑定，故同时写 R8 / Rg8 的 sprite/subtract 各需两个变体。
+        let sprite_pipeline = build_fullscreen(&device, "sprite", &sprite_shader(), "fs_main", MASK_FORMAT, &create_sprite_bgl(&device), sprite_blend, true, all, MSAA_SAMPLES);
+        let sprite_pipeline_rg8 = build_fullscreen(&device, "sprite_rg8", &sprite_shader(), "fs_main", MASK2_FORMAT, &create_sprite_bgl(&device), sprite_blend, true, all, MSAA_SAMPLES);
+        let compose1_pipeline = build_fullscreen(&device, "compose1", &compose1_shader(), "fs_main", MASK_FORMAT, &create_compose1_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let compose2_pipeline = build_fullscreen(&device, "compose2", &compose2_shader(), "fs_main", MASK2_FORMAT, &create_compose2_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let edge_pipeline = build_fullscreen(&device, "edge", &edge_shader(), "fs_main", MASK2_FORMAT, &create_edge_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let glow_pipeline = build_fullscreen(&device, "glow", &glow_shader(), "fs_main", MASK2_FORMAT, &create_glow_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let glow_final_pipeline = build_fullscreen(&device, "glow_final", &glow_final_shader(), "fs_main", MASK2_FORMAT, &create_glow_final_bgl(&device), wgpu::BlendState::REPLACE, false, wgpu::ColorWrites::GREEN, 1);
+        let subtract_pipeline = build_fullscreen(&device, "subtract_blender", &subtract_blender_shader(), "fs_main", MASK_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
+        let subtract_pipeline_rg8 = build_fullscreen(&device, "subtract_blender_rg8", &subtract_blender_shader(), "fs_main", MASK2_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
         let disabled_pipeline = build_fullscreen(&device, "disabled", &disabled_shader(), "fs_main", config.format, &create_disabled_bgl(&device), wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }, false, all, MSAA_SAMPLES);
+        let ready_pipeline = build_fullscreen(&device, "ready", &ready_shader(), "fs_main", MASK2_FORMAT, &create_ready_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
         let active_pipeline = build_fullscreen(&device, "active", &active_shader(), "fs_main", config.format, &create_active_bgl(&device), wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, false, all, 1);
+        let scene_pipeline = build_fullscreen(&device, "scene", &scene_shader(), "fs_main", config.format, &create_scene_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
         let copy_pipeline = build_fullscreen(&device, "copy", COPY_SHADER, "fs_main", config.format, &create_copy_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
         // 背景压暗：叠两张黑色矩形（alpha 0.5 / 0.1），SrcAlpha, OneMinusSrcAlpha
         let overlay_blend = wgpu::BlendState {
@@ -925,19 +1011,20 @@ impl Renderer {
 
         let mask_size = mask_dimensions(config.width, config.height);
         let effect_size = effect_dimensions(config.width, config.height);
-        let (m_normal, rt_normal) = create_rt_msaa(&device, mask_size, "normal", BLOCK_FORMAT);
-        let (m_subtract, rt_subtract) = create_rt_msaa(&device, mask_size, "subtract", BLOCK_FORMAT);
-        let (m_disabled_normal, rt_disabled_normal) = create_rt_msaa(&device, mask_size, "disabled_normal", BLOCK_FORMAT);
-        let (m_disabled_subtract, rt_disabled_subtract) = create_rt_msaa(&device, mask_size, "disabled_subtract", BLOCK_FORMAT);
-        let (m_ready_normal, rt_ready_normal) = create_rt_msaa(&device, mask_size, "ready_normal", BLOCK_FORMAT);
-        let (m_ready_subtract, rt_ready_subtract) = create_rt_msaa(&device, mask_size, "ready_subtract", BLOCK_FORMAT);
+        let (m_normal, rt_normal) = create_rt_msaa(&device, mask_size, "normal", MASK_FORMAT);
+        let (m_subtract, rt_subtract) = create_rt_msaa(&device, mask_size, "subtract", MASK_FORMAT);
+        let (m_disabled_normal, rt_disabled_normal) = create_rt_msaa(&device, mask_size, "disabled_normal", MASK2_FORMAT);
+        let (m_disabled_subtract, rt_disabled_subtract) = create_rt_msaa(&device, mask_size, "disabled_subtract", MASK2_FORMAT);
+        let (m_ready_normal, rt_ready_normal) = create_rt_msaa(&device, mask_size, "ready_normal", MASK2_FORMAT);
+        let (m_ready_subtract, rt_ready_subtract) = create_rt_msaa(&device, mask_size, "ready_subtract", MASK2_FORMAT);
         let mask_msaa = vec![m_normal, m_subtract, m_disabled_normal, m_disabled_subtract, m_ready_normal, m_ready_subtract];
-        let rt_composed_enabled = create_rt(&device, mask_size, "composed_enabled");
+        let rt_composed_enabled = create_rt_fmt(&device, mask_size, "composed_enabled", MASK_FORMAT);
         let rt_composed_disabled = create_rt(&device, mask_size, "composed_disabled");
+        let rt_ready_out = create_rt(&device, mask_size, "ready_out");
         let rt_effect = create_rt(&device, effect_size, "effect");
         let ping_a = create_rt(&device, effect_size, "pingA");
         let ping_b = create_rt(&device, effect_size, "pingB");
-        // sceneColorRT = Screen/6（Point）；scene_full 是 active 合成前的完整相机目标
+        // sceneColorRT = Screen/6（Point）；保留全彩（见 `MASK2_FORMAT` 注释）
         let scene_size = scene_dimensions(config.width, config.height);
         let rt_scene = create_rt_fmt(&device, scene_size, "scene", config.format);
         let (scene_full_msaa, rt_scene_full) = create_rt_msaa(&device, [config.width, config.height], "scene_full", config.format);
@@ -962,7 +1049,9 @@ impl Renderer {
         }
         let glow_final_bg = bg_glow_final(&device, &block_uniform, &ping_a.1, &rt_sampler);
         let disabled_bg = bg_disabled(&device, &block_uniform, &rt_composed_disabled.1, &disp_tex.view, &spark_tex.view, &rt_sampler, &disp_sampler, &spark_sampler);
-        let active_bg = bg_active(&device, &block_uniform, &rt_composed_enabled.1, &rt_effect.1, &rt_ready_normal.1, &rt_ready_subtract.1, &rt_composed_disabled.1, &disp_tex.view, &spark_tex.view, &rt_scene.1, &rt_sampler, &disp_sampler, &spark_sampler, &effect_sampler);
+        let ready_bg = bg_ready(&device, &block_uniform, &rt_ready_normal.1, &rt_ready_subtract.1, &rt_composed_disabled.1, &rt_sampler);
+        let active_bg = bg_active(&device, &block_uniform, &rt_composed_enabled.1, &rt_effect.1, &rt_ready_out.1, &disp_tex.view, &spark_tex.view, &rt_scene.1, &rt_sampler, &disp_sampler, &spark_sampler, &effect_sampler);
+        let scene_bg = bg_scene(&device, &rt_scene_full.1, &rt_subtract.1, &rt_sampler);
         let copy_bg = bg_copy(&device, &rt_scene_full.1, &rt_sampler);
         let bg_bg = bg_copy(&device, &bg_view, &bg_sampler);
         let overlay_tex_a = solid_texture(&device, &queue, [0, 0, 0, 128]); // alpha 0.5
@@ -978,16 +1067,16 @@ impl Renderer {
         Self {
             surface, device, queue, config,
             pipeline, vertex_buffer, vertex_capacity: INITIAL_VERTEX_CAPACITY,
-            sprite_pipeline, compose1_pipeline, compose2_pipeline, edge_pipeline, glow_pipeline, glow_final_pipeline, subtract_pipeline, disabled_pipeline, active_pipeline, copy_pipeline, overlay_pipeline,
-            sprite_bg, compose1_bg, compose2_bg, edge_bg, glow_bgs, glow_final_bg, disabled_bg, active_bg, copy_bg, bg_bg, overlay_bg_a, overlay_bg_b,
+            sprite_pipeline, sprite_pipeline_rg8, compose1_pipeline, compose2_pipeline, edge_pipeline, glow_pipeline, glow_final_pipeline, subtract_pipeline, subtract_pipeline_rg8, disabled_pipeline, ready_pipeline, active_pipeline, scene_pipeline, copy_pipeline, overlay_pipeline,
+            sprite_bg, compose1_bg, compose2_bg, edge_bg, glow_bgs, glow_final_bg, disabled_bg, ready_bg, active_bg, scene_bg, copy_bg, bg_bg, overlay_bg_a, overlay_bg_b,
             block_vertex_buffer, block_capacity: INITIAL_BLOCK_CAPACITY, block_uniform, glow_configs, rt_sampler, disp_sampler, spark_sampler, effect_sampler,
             disp_view: disp_tex.view, spark_view: spark_tex.view,
-            rt_normal, rt_subtract, rt_disabled_normal, rt_disabled_subtract, rt_ready_normal, rt_ready_subtract, rt_composed_enabled, rt_composed_disabled, rt_effect, ping_a, ping_b, rt_scene_full, rt_scene, mask_msaa, scene_full_msaa,
+            rt_normal, rt_subtract, rt_disabled_normal, rt_disabled_subtract, rt_ready_normal, rt_ready_subtract, rt_ready_out, rt_composed_enabled, rt_composed_disabled, rt_effect, ping_a, ping_b, rt_scene_full, rt_scene, mask_msaa, scene_full_msaa,
             block_time: 0.0, size: surface_size, render_size: surface_size, render_scale: 1.0, design, fit: Fit::default(), origin: [0.0, 0.0], y_up: false, ctm: Affine2::IDENTITY, transform_stack: Vec::new(), fps: Fps::new(), vsync,
             lines: Vec::new(), vertices: Vec::new(), block_vertices: Vec::new(),
             note_pipeline, note_bind_groups, note_tex_size, note_tex_alpha, note_tex_blue, note_buffer, note_capacity: INITIAL_NOTE_CAPACITY, note_vertices: Vec::new(), note_sprites: Vec::new(), hit_frame_count,
             font, glyphs: HashMap::new(), ui_images, atlas_data, atlas_x: atlas_cursor.0, atlas_y: atlas_cursor.1, atlas_row_h: atlas_cursor.2, atlas_dirty: true,
-            text_atlas_tex, text_bg, text_pipeline, text_buffer, text_capacity: INITIAL_NOTE_CAPACITY, text_vertices: Vec::new(),
+            text_atlas_tex, text_bg, text_pipeline, text_buffer, text_capacity: INITIAL_NOTE_CAPACITY, text_vertices: Vec::new(), top_text_buffer, top_text_capacity: INITIAL_NOTE_CAPACITY, top_text_vertices: Vec::new(),
             export_rt: None, export_buffer: None, export_padded_bytes_per_row: 0, export_size: [0, 0],
         }
     }
@@ -1045,12 +1134,12 @@ impl Renderer {
         let tex = texture.index();
         let size = self.note_tex_size[tex];
         let height = width * size[1] / size[0] * if flip_v { -1.0 } else { 1.0 };
-        self.note_sprites.push(NoteSprite { center, width, height, angle: angle.to_radians(), texture: tex, color, uv_x: [0.0, 1.0], transform: self.ctm, layer: 1 });
+        self.note_sprites.push(NoteSprite { center, width, height, angle: angle.to_radians(), texture: tex, color, uv_x: [0.0, 1.0], uv_y: [0.0, 1.0], transform: self.ctm, layer: 1 });
     }
 
     /// 绘制指定宽高的音符四边形（Hold 主体用，高度随 Hold 长度变化）。`uv_x` 用于裁剪贴图左右留白。
     pub fn draw_note_sized(&mut self, center: [f32; 2], width: f32, height: f32, angle: f32, texture: NoteTexture, color: [f32; 4], uv_x: [f32; 2]) {
-        self.note_sprites.push(NoteSprite { center, width, height, angle: angle.to_radians(), texture: texture.index(), color, uv_x, transform: self.ctm, layer: 0 });
+        self.note_sprites.push(NoteSprite { center, width, height, angle: angle.to_radians(), texture: texture.index(), color, uv_x, uv_y: [0.0, 1.0], transform: self.ctm, layer: 0 });
     }
 
     /// 打击特效帧数量（`assets/hit/img-*.png`）。
@@ -1058,17 +1147,22 @@ impl Renderer {
         self.hit_frame_count
     }
 
-    /// 绘制一帧打击特效（正方形、轴对齐，不随判定线旋转）。`frame` 会被裁剪到有效范围。
+    /// 绘制一帧打击特效（从 `hit/hit.png` 图集裁剪；正方形、轴对齐，不随判定线旋转）。
+    /// `frame` 会被裁剪到有效范围；图集一行 [`HIT_ATLAS_COLS`] 帧、共 [`HIT_ATLAS_ROWS`] 行。
     pub fn draw_hit(&mut self, center: [f32; 2], size: f32, frame: usize, color: [f32; 4]) {
         if self.hit_frame_count == 0 { return; }
         let frame = frame.min(self.hit_frame_count - 1);
-        self.note_sprites.push(NoteSprite { center, width: size, height: size, angle: 0.0, texture: NOTE_TEXTURE_COUNT + frame, color, uv_x: [0.0, 1.0], transform: self.ctm, layer: 2 });
+        let col = frame % HIT_ATLAS_COLS;
+        let row = frame / HIT_ATLAS_COLS;
+        let uv_x = [col as f32 / HIT_ATLAS_COLS as f32, (col + 1) as f32 / HIT_ATLAS_COLS as f32];
+        let uv_y = [row as f32 / HIT_ATLAS_ROWS as f32, (row + 1) as f32 / HIT_ATLAS_ROWS as f32];
+        self.note_sprites.push(NoteSprite { center, width: size, height: size, angle: 0.0, texture: NOTE_TEXTURE_COUNT, color, uv_x, uv_y, transform: self.ctm, layer: 2 });
     }
 
     /// 绘制打击特效的金色小方块（轴对齐正方形，用顶点色染色）。
     pub fn draw_spark(&mut self, center: [f32; 2], size: f32, color: [f32; 4]) {
-        let texture = NOTE_TEXTURE_COUNT + self.hit_frame_count;
-        self.note_sprites.push(NoteSprite { center, width: size, height: size, angle: 0.0, texture, color, uv_x: [0.0, 1.0], transform: self.ctm, layer: 2 });
+        let texture = NOTE_TEXTURE_COUNT + 1;
+        self.note_sprites.push(NoteSprite { center, width: size, height: size, angle: 0.0, texture, color, uv_x: [0.0, 1.0], uv_y: [0.0, 1.0], transform: self.ctm, layer: 2 });
     }
 
     /// 在文本图集里分配一块区域。
@@ -1131,27 +1225,39 @@ impl Renderer {
     }
 
     /// 以 `(x, baseline_y)` 为基线、`px` 为字号绘制文本（用户空间，y 向上）。
+    /// 该层在 active 块合成**之前**绘制，会被块效果影响（`_SceneColor` / 覆盖）。
     pub fn draw_text(&mut self, text: &str, x: f32, baseline_y: f32, px: f32, color: [f32; 4]) {
+        self.draw_text_impl(text, x, baseline_y, px, color, false);
+    }
+
+    /// 与水印等「最上层」文本：在 active 块合成**之后**绘制，不受块影响。
+    pub fn draw_text_top(&mut self, text: &str, x: f32, baseline_y: f32, px: f32, color: [f32; 4]) {
+        self.draw_text_impl(text, x, baseline_y, px, color, true);
+    }
+
+    fn draw_text_impl(&mut self, text: &str, x: f32, baseline_y: f32, px: f32, color: [f32; 4], top: bool) {
         let base = self.to_ndc();
         let pxu = px.round().max(1.0) as u32;
         let mut pen = x;
+        let mut quads: Vec<NoteVertex> = Vec::new();
         for ch in text.chars() {
             let g = self.glyph_for(ch, pxu);
             if g.size[0] > 0.0 {
                 let left = pen + g.left;
-                let top = baseline_y + g.top;
+                let top_y = baseline_y + g.top;
                 let (w, h) = (g.size[0], g.size[1]);
                 let (u0, v0, u1, v1) = (g.uv[0], g.uv[1], g.uv[2], g.uv[3]);
-                let tl = base([left, top]);
-                let tr = base([left + w, top]);
-                let br = base([left + w, top - h]);
-                let bl = base([left, top - h]);
+                let tl = base([left, top_y]);
+                let tr = base([left + w, top_y]);
+                let br = base([left + w, top_y - h]);
+                let bl = base([left, top_y - h]);
                 for (p, uv) in [(tl, [u0, v0]), (tr, [u1, v0]), (br, [u1, v1]), (tl, [u0, v0]), (br, [u1, v1]), (bl, [u0, v1])] {
-                    self.text_vertices.push(NoteVertex { position: p, uv, color });
+                    quads.push(NoteVertex { position: p, uv, color });
                 }
             }
             pen += g.advance;
         }
+        if top { self.top_text_vertices.extend(quads); } else { self.text_vertices.extend(quads); }
     }
 
     /// 绘制一张打包进文本图集的 UI 图片（在用户空间中按 `center`/`size` 居中）。
@@ -1214,10 +1320,10 @@ impl Renderer {
         let map = self.to_ndc();
         let (hx, hy) = (width / 2.0, height / 2.0);
         let rad = angle.to_radians();
-        // 垂直向量取 (sin, -cos)：`to_ndc` 里已并入 y 轴翻转，
-        // 与旧的「先取负角度再映射」等价，保证贴图朝向不变。
+        // 单位 quad 的局部轴：Unity `eulerAngles.z` 逆时针时，局部 X = (cos, sin)、
+        // 局部 Y = (-sin, cos)。`map`（`to_ndc`）再统一做屏幕 y 轴翻转。
         let dir = [rad.cos(), rad.sin()];
-        let perp = [rad.sin(), -rad.cos()];
+        let perp = [-rad.sin(), rad.cos()];
         let corner = |dx: f32, dy: f32| map(ctm.apply([center[0] + dir[0] * dx + perp[0] * dy, center[1] + dir[1] * dx + perp[1] * dy]));
         let a0 = corner(-hx, -hy); let a1 = corner(-hx, hy); let b1 = corner(hx, hy); let b0 = corner(hx, -hy);
         let v = |position: [f32; 2], uv: [f32; 2]| BlockVertex { position, uv, color, phase };
@@ -1226,7 +1332,7 @@ impl Renderer {
         }
     }
 
-    pub fn clear(&mut self) { self.lines.clear(); self.block_vertices.clear(); self.note_sprites.clear(); self.text_vertices.clear(); }
+    pub fn clear(&mut self) { self.lines.clear(); self.block_vertices.clear(); self.note_sprites.clear(); self.text_vertices.clear(); self.top_text_vertices.clear(); }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 { return; }
@@ -1248,16 +1354,17 @@ impl Renderer {
     fn recreate_targets(&mut self, width: u32, height: u32) {
         let mask_size = mask_dimensions(width, height);
         let effect_size = effect_dimensions(width, height);
-        let (m_normal, rt_normal) = create_rt_msaa(&self.device, mask_size, "normal", BLOCK_FORMAT);
-        let (m_subtract, rt_subtract) = create_rt_msaa(&self.device, mask_size, "subtract", BLOCK_FORMAT);
-        let (m_disabled_normal, rt_disabled_normal) = create_rt_msaa(&self.device, mask_size, "disabled_normal", BLOCK_FORMAT);
-        let (m_disabled_subtract, rt_disabled_subtract) = create_rt_msaa(&self.device, mask_size, "disabled_subtract", BLOCK_FORMAT);
-        let (m_ready_normal, rt_ready_normal) = create_rt_msaa(&self.device, mask_size, "ready_normal", BLOCK_FORMAT);
-        let (m_ready_subtract, rt_ready_subtract) = create_rt_msaa(&self.device, mask_size, "ready_subtract", BLOCK_FORMAT);
+        let (m_normal, rt_normal) = create_rt_msaa(&self.device, mask_size, "normal", MASK_FORMAT);
+        let (m_subtract, rt_subtract) = create_rt_msaa(&self.device, mask_size, "subtract", MASK_FORMAT);
+        let (m_disabled_normal, rt_disabled_normal) = create_rt_msaa(&self.device, mask_size, "disabled_normal", MASK2_FORMAT);
+        let (m_disabled_subtract, rt_disabled_subtract) = create_rt_msaa(&self.device, mask_size, "disabled_subtract", MASK2_FORMAT);
+        let (m_ready_normal, rt_ready_normal) = create_rt_msaa(&self.device, mask_size, "ready_normal", MASK2_FORMAT);
+        let (m_ready_subtract, rt_ready_subtract) = create_rt_msaa(&self.device, mask_size, "ready_subtract", MASK2_FORMAT);
         self.rt_normal = rt_normal; self.rt_subtract = rt_subtract; self.rt_disabled_normal = rt_disabled_normal; self.rt_disabled_subtract = rt_disabled_subtract; self.rt_ready_normal = rt_ready_normal; self.rt_ready_subtract = rt_ready_subtract;
         self.mask_msaa = vec![m_normal, m_subtract, m_disabled_normal, m_disabled_subtract, m_ready_normal, m_ready_subtract];
-        self.rt_composed_enabled = create_rt(&self.device, mask_size, "composed_enabled");
+        self.rt_composed_enabled = create_rt_fmt(&self.device, mask_size, "composed_enabled", MASK_FORMAT);
         self.rt_composed_disabled = create_rt(&self.device, mask_size, "composed_disabled");
+        self.rt_ready_out = create_rt(&self.device, mask_size, "ready_out");
         self.rt_effect = create_rt(&self.device, effect_size, "effect");
         self.ping_a = create_rt(&self.device, effect_size, "pingA");
         self.ping_b = create_rt(&self.device, effect_size, "pingB");
@@ -1285,11 +1392,15 @@ impl Renderer {
         }
         let gf = bg_glow_final(&self.device, &self.block_uniform, &self.ping_a.1, &self.rt_sampler);
         let db = bg_disabled(&self.device, &self.block_uniform, &self.rt_composed_disabled.1, &disp, &spark, &self.rt_sampler, &self.disp_sampler, &self.spark_sampler);
-        let ab = bg_active(&self.device, &self.block_uniform, &self.rt_composed_enabled.1, &self.rt_effect.1, &self.rt_ready_normal.1, &self.rt_ready_subtract.1, &self.rt_composed_disabled.1, &disp, &spark, &self.rt_scene.1, &self.rt_sampler, &self.disp_sampler, &self.spark_sampler, &self.effect_sampler);
+        let rb = bg_ready(&self.device, &self.block_uniform, &self.rt_ready_normal.1, &self.rt_ready_subtract.1, &self.rt_composed_disabled.1, &self.rt_sampler);
+        let ab = bg_active(&self.device, &self.block_uniform, &self.rt_composed_enabled.1, &self.rt_effect.1, &self.rt_ready_out.1, &disp, &spark, &self.rt_scene.1, &self.rt_sampler, &self.disp_sampler, &self.spark_sampler, &self.effect_sampler);
+        let sb = bg_scene(&self.device, &self.rt_scene_full.1, &self.rt_subtract.1, &self.rt_sampler);
         self.copy_bg = bg_copy(&self.device, &self.rt_scene_full.1, &self.rt_sampler);
         self.glow_final_bg = gf;
         self.disabled_bg = db;
+        self.ready_bg = rb;
         self.active_bg = ab;
+        self.scene_bg = sb;
     }
 
     fn viewport(&self) -> (f32, f32, f32, f32) {
@@ -1369,7 +1480,8 @@ impl Renderer {
                 let a0 = corner(-hw, -hh); let a1 = corner(-hw, hh); let b1 = corner(hw, hh); let b0 = corner(hw, -hh);
                 let v = |position: [f32; 2], uv: [f32; 2]| NoteVertex { position, uv, color: s.color };
                 let (u0, u1) = (s.uv_x[0], s.uv_x[1]);
-                for (pos, uv) in [(a0, [u0, 1.0]), (a1, [u0, 0.0]), (b1, [u1, 0.0]), (a0, [u0, 1.0]), (b1, [u1, 0.0]), (b0, [u1, 1.0])] {
+                let (v0, v1) = (s.uv_y[0], s.uv_y[1]);
+                for (pos, uv) in [(a0, [u0, v1]), (a1, [u0, v0]), (b1, [u1, v0]), (a0, [u0, v1]), (b1, [u1, v0]), (b0, [u1, v1])] {
                     self.note_vertices.push(v(pos, uv));
                 }
                 match note_draws.last_mut() {
@@ -1435,12 +1547,17 @@ impl Renderer {
             self.ensure_text_capacity(self.text_vertices.len());
             self.queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&self.text_vertices));
         }
+        if !self.top_text_vertices.is_empty() {
+            self.ensure_top_text_capacity(self.top_text_vertices.len());
+            self.queue.write_buffer(&self.top_text_buffer, 0, bytemuck::cast_slice(&self.top_text_vertices));
+        }
     }
 
     fn ensure_vertex_capacity(&mut self, needed: usize) { if needed <= self.vertex_capacity { return; } let c = needed.next_power_of_two(); self.vertex_buffer = create_vertex_buffer(&self.device, c); self.vertex_capacity = c; }
     fn ensure_block_capacity(&mut self, needed: usize) { if needed <= self.block_capacity { return; } let c = needed.next_power_of_two(); self.block_vertex_buffer = create_block_vertex_buffer(&self.device, c); self.block_capacity = c; }
     fn ensure_note_capacity(&mut self, needed: usize) { if needed <= self.note_capacity { return; } let c = needed.next_power_of_two(); self.note_buffer = create_note_vertex_buffer(&self.device, c); self.note_capacity = c; }
     fn ensure_text_capacity(&mut self, needed: usize) { if needed <= self.text_capacity { return; } let c = needed.next_power_of_two(); self.text_buffer = create_note_vertex_buffer(&self.device, c); self.text_capacity = c; }
+    fn ensure_top_text_capacity(&mut self, needed: usize) { if needed <= self.top_text_capacity { return; } let c = needed.next_power_of_two(); self.top_text_buffer = create_note_vertex_buffer(&self.device, c); self.top_text_capacity = c; }
 
     fn phase_range(&self, phase: f32) -> (u32, u32) {
         let start = self.block_vertices.partition_point(|v| v.phase < phase) as u32;
@@ -1453,7 +1570,8 @@ impl Renderer {
             // 6 张遮罩：普通块用 BlockSprite，减块用 SubtractBlockBlender（逐 quad）
             let targets = [&self.rt_normal.1, &self.rt_subtract.1, &self.rt_disabled_normal.1, &self.rt_disabled_subtract.1, &self.rt_ready_normal.1, &self.rt_ready_subtract.1];
             let phases = [PHASE_NORMAL, PHASE_SUBTRACT, PHASE_DISABLED_NORMAL, PHASE_DISABLED_SUBTRACT, PHASE_READY_NORMAL, PHASE_READY_SUBTRACT];
-            let pipes = [&self.sprite_pipeline, &self.subtract_pipeline, &self.sprite_pipeline, &self.subtract_pipeline, &self.sprite_pipeline, &self.subtract_pipeline];
+            // 管线与目标格式一一对应：rt_normal/subtract 为 R8，其余遮罩为 RG16（Rg8）。
+            let pipes = [&self.sprite_pipeline, &self.subtract_pipeline, &self.sprite_pipeline_rg8, &self.subtract_pipeline_rg8, &self.sprite_pipeline_rg8, &self.subtract_pipeline_rg8];
             // ready 阶段同时写入 merged（disabled_*）与 ready_* 两张
             let extra = [(4usize, 2usize), (5usize, 3usize)];
             for (i, target) in targets.iter().enumerate() {
@@ -1475,6 +1593,8 @@ impl Renderer {
             // compose1 / compose2
             self.fullscreen_pass(encoder, &self.rt_composed_enabled.1, &self.compose1_pipeline, &self.compose1_bg);
             self.fullscreen_pass(encoder, &self.rt_composed_disabled.1, &self.compose2_pipeline, &self.compose2_bg);
+            // Unlit/ReadyBlock：纯预备遮罩 + 禁用合成 -> 呼吸脉冲（rt_ready_out）
+            self.fullscreen_pass(encoder, &self.rt_ready_out.1, &self.ready_pipeline, &self.ready_bg);
             // edge -> effect.R
             self.fullscreen_pass(encoder, &self.rt_effect.1, &self.edge_pipeline, &self.edge_bg);
             // glow ping-pong
@@ -1522,8 +1642,22 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
         }
-        // 2) Blit(CameraTarget -> sceneColorRT)，供 ActiveBlock 的 `_SceneColor`
-        self.fullscreen_pass(encoder, &self.rt_scene.1, &self.copy_pipeline, &self.copy_bg);
+        // 1.5) HUD（暂停/连击/分数/进度）：在场景快照之前绘制，故会被 active 块通过
+        //      `_SceneColor` 与覆盖影响；水印不在此列（见步骤 3.5）。
+        if !self.text_vertices.is_empty() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hud_under_blocks"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.rt_scene_full.1, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.text_pipeline);
+            pass.set_bind_group(0, &self.text_bg, &[]);
+            pass.set_vertex_buffer(0, self.text_buffer.slice(..));
+            pass.draw(0..self.text_vertices.len() as u32, 0..1);
+        }
+        // 2) Blit(CameraTarget -> sceneColorRT)：由 scene pass 同时把生效减块从场景色中
+        //    扣除（等价 `SubtractBlockPostProcessor`），供 ActiveBlock 的 `_SceneColor`。
+        self.fullscreen_pass(encoder, &self.rt_scene.1, &self.scene_pipeline, &self.scene_bg);
         // 3) ActiveBlock 预乘覆盖到 scene_full（此时 `_SceneColor` 已就绪）
         if block_count > 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1535,17 +1669,17 @@ impl Renderer {
             pass.set_bind_group(0, &self.active_bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        // 3.5) HUD（分数/连击/暂停/进度/水印）：叠加到 scene_full 最上层
-        if !self.text_vertices.is_empty() {
+        // 3.5) 水印：始终叠加到 scene_full 最上层，不受块影响
+        if !self.top_text_vertices.is_empty() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("text"),
+                label: Some("watermark"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.rt_scene_full.1, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
                 ..Default::default()
             });
             pass.set_pipeline(&self.text_pipeline);
             pass.set_bind_group(0, &self.text_bg, &[]);
-            pass.set_vertex_buffer(0, self.text_buffer.slice(..));
-            pass.draw(0..self.text_vertices.len() as u32, 0..1);
+            pass.set_vertex_buffer(0, self.top_text_buffer.slice(..));
+            pass.draw(0..self.top_text_vertices.len() as u32, 0..1);
         }
         // 4) 合成结果拷贝到目标（交换链或离屏导出纹理）
         self.fullscreen_pass(encoder, view, &self.copy_pipeline, &self.copy_bg);
@@ -1832,7 +1966,7 @@ fn effect_dimensions(w: u32, h: u32) -> [u32; 2] { [(w / EFFECT_DOWNSCALE).max(1
 fn scene_dimensions(w: u32, h: u32) -> [u32; 2] { [(w / 6).max(1), (h / 6).max(1)] }
 
 fn create_rt(device: &wgpu::Device, size: [u32; 2], label: &str) -> (wgpu::Texture, wgpu::TextureView) {
-    create_rt_fmt(device, size, label, BLOCK_FORMAT)
+    create_rt_fmt(device, size, label, MASK2_FORMAT)
 }
 
 fn create_rt_fmt(device: &wgpu::Device, size: [u32; 2], label: &str, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
@@ -1871,7 +2005,9 @@ fn create_edge_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "edge", &
 fn create_glow_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "glow", &[ub(0), ubf(1), tex(2), tex(3), smp(4)]) }
 fn create_glow_final_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "glow_final", &[ub(0), tex(1), smp(2)]) }
 fn create_disabled_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "disabled", &[ub(0), tex(1), tex(2), tex(3), smp(4), smp(5), smp(6)]) }
-fn create_active_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "active", &[ub(0), tex(1), tex(2), tex(3), tex(4), tex(5), tex(6), tex(7), smp(8), smp(9), smp(10), tex(11), smp(12)]) }
+fn create_ready_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "ready", &[ub(0), tex(1), tex(2), tex(3), smp(4)]) }
+fn create_active_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "active", &[ub(0), tex(1), tex(2), tex(3), tex(4), tex(5), smp(6), smp(7), smp(8), tex(9), smp(10)]) }
+fn create_scene_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "scene", &[tex(0), tex(1), smp(2)]) }
 fn create_copy_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "copy", &[tex(0), smp(1)]) }
 fn create_note_bgl(d: &wgpu::Device) -> wgpu::BindGroupLayout { bgl(d, "note", &[tex(0), smp(1)]) }
 
@@ -1896,9 +2032,15 @@ fn bg_glow_final(d: &wgpu::Device, u: &wgpu::Buffer, t0: &wgpu::TextureView, s: 
 fn bg_disabled(d: &wgpu::Device, u: &wgpu::Buffer, t0: &wgpu::TextureView, t1: &wgpu::TextureView, t2: &wgpu::TextureView, rt_s: &wgpu::Sampler, disp_s: &wgpu::Sampler, spark_s: &wgpu::Sampler) -> wgpu::BindGroup {
     d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_disabled_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(t1) }, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(t2) }, wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(rt_s) }, wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(disp_s) }, wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(spark_s) }] })
 }
+fn bg_ready(d: &wgpu::Device, u: &wgpu::Buffer, ready_n: &wgpu::TextureView, ready_s: &wgpu::TextureView, compose: &wgpu::TextureView, s: &wgpu::Sampler) -> wgpu::BindGroup {
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_ready_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ready_n) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(ready_s) }, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(compose) }, wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(s) }] })
+}
 #[allow(clippy::too_many_arguments)]
-fn bg_active(d: &wgpu::Device, u: &wgpu::Buffer, t0: &wgpu::TextureView, t1: &wgpu::TextureView, t2: &wgpu::TextureView, t3: &wgpu::TextureView, t4: &wgpu::TextureView, t5: &wgpu::TextureView, t6: &wgpu::TextureView, t7: &wgpu::TextureView, rt_s: &wgpu::Sampler, disp_s: &wgpu::Sampler, spark_s: &wgpu::Sampler, effect_s: &wgpu::Sampler) -> wgpu::BindGroup {
-    d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_active_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(t1) }, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(t2) }, wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(t3) }, wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(t4) }, wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(t5) }, wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(t6) }, wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(rt_s) }, wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(disp_s) }, wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(spark_s) }, wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(t7) }, wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::Sampler(effect_s) }] })
+fn bg_active(d: &wgpu::Device, u: &wgpu::Buffer, t0: &wgpu::TextureView, t1: &wgpu::TextureView, t2: &wgpu::TextureView, t3: &wgpu::TextureView, t4: &wgpu::TextureView, t5: &wgpu::TextureView, rt_s: &wgpu::Sampler, disp_s: &wgpu::Sampler, spark_s: &wgpu::Sampler, effect_s: &wgpu::Sampler) -> wgpu::BindGroup {
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_active_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(t1) }, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(t2) }, wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(t3) }, wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(t4) }, wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(rt_s) }, wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(disp_s) }, wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(spark_s) }, wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(t5) }, wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(effect_s) }] })
+}
+fn bg_scene(d: &wgpu::Device, scene: &wgpu::TextureView, subtract: &wgpu::TextureView, s: &wgpu::Sampler) -> wgpu::BindGroup {
+    d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_scene_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(scene) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(subtract) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(s) }] })
 }
 fn bg_copy(d: &wgpu::Device, t0: &wgpu::TextureView, s: &wgpu::Sampler) -> wgpu::BindGroup {
     d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &create_copy_bgl(d), entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t0) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(s) }] })
@@ -1982,15 +2124,19 @@ mod shader_tests {
         let fmt = wgpu::TextureFormat::Rgba8Unorm;
         let all = wgpu::ColorWrites::ALL;
         let _ = build_line_pipeline(&device, fmt, MSAA_SAMPLES);
-        let _ = build_fullscreen(&device, "sprite", &sprite_shader(), "fs_main", BLOCK_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
-        let _ = build_fullscreen(&device, "compose1", &compose1_shader(), "fs_main", BLOCK_FORMAT, &create_compose1_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let _ = build_fullscreen(&device, "compose2", &compose2_shader(), "fs_main", BLOCK_FORMAT, &create_compose2_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let _ = build_fullscreen(&device, "edge", &edge_shader(), "fs_main", BLOCK_FORMAT, &create_edge_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let _ = build_fullscreen(&device, "glow", &glow_shader(), "fs_main", BLOCK_FORMAT, &create_glow_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
-        let _ = build_fullscreen(&device, "glow_final", &glow_final_shader(), "fs_main", BLOCK_FORMAT, &create_glow_final_bgl(&device), wgpu::BlendState::REPLACE, false, wgpu::ColorWrites::GREEN, 1);
-        let _ = build_fullscreen(&device, "subtract", &subtract_blender_shader(), "fs_main", BLOCK_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
+        let _ = build_fullscreen(&device, "sprite", &sprite_shader(), "fs_main", MASK_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
+        let _ = build_fullscreen(&device, "sprite_rg8", &sprite_shader(), "fs_main", MASK2_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
+        let _ = build_fullscreen(&device, "compose1", &compose1_shader(), "fs_main", MASK_FORMAT, &create_compose1_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let _ = build_fullscreen(&device, "compose2", &compose2_shader(), "fs_main", MASK2_FORMAT, &create_compose2_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let _ = build_fullscreen(&device, "edge", &edge_shader(), "fs_main", MASK2_FORMAT, &create_edge_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let _ = build_fullscreen(&device, "glow", &glow_shader(), "fs_main", MASK2_FORMAT, &create_glow_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
+        let _ = build_fullscreen(&device, "glow_final", &glow_final_shader(), "fs_main", MASK2_FORMAT, &create_glow_final_bgl(&device), wgpu::BlendState::REPLACE, false, wgpu::ColorWrites::GREEN, 1);
+        let _ = build_fullscreen(&device, "subtract", &subtract_blender_shader(), "fs_main", MASK_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
+        let _ = build_fullscreen(&device, "subtract_rg8", &subtract_blender_shader(), "fs_main", MASK2_FORMAT, &create_sprite_bgl(&device), wgpu::BlendState::REPLACE, true, all, MSAA_SAMPLES);
         let _ = build_fullscreen(&device, "disabled", &disabled_shader(), "fs_main", fmt, &create_disabled_bgl(&device), wgpu::BlendState::REPLACE, false, all, MSAA_SAMPLES);
+        let _ = build_fullscreen(&device, "ready", &ready_shader(), "fs_main", MASK2_FORMAT, &create_ready_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
         let _ = build_fullscreen(&device, "active", &active_shader(), "fs_main", fmt, &create_active_bgl(&device), wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, false, all, 1);
+        let _ = build_fullscreen(&device, "scene", &scene_shader(), "fs_main", fmt, &create_scene_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
         let _ = build_fullscreen(&device, "copy", COPY_SHADER, "fs_main", fmt, &create_copy_bgl(&device), wgpu::BlendState::REPLACE, false, all, 1);
     }
 }

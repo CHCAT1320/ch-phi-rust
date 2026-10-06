@@ -43,10 +43,45 @@ const SPARK_SIZE: f32 = 15.0 / 100.0;
 /// 音符「实时垂直距离」上限：`speed·currentFloorPosition` 超过它即不可见（2H，docs 实测）。
 const FAR_LIMIT: f32 = 3.3333336;
 
-/// 打击音效在 [`ChartRuntime::sfx`] 中的下标。
+/// 默认打击音效在 [`ChartRuntime::sfx`] 中的下标。
 const SFX_TAP: usize = 0;
 const SFX_DRAG: usize = 1;
 const SFX_FLICK: usize = 2;
+
+/// 打击音效播放模式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SfxMode {
+    /// 默认：按音符类型选 `tap`/`drag`/`flick`。
+    Default,
+    /// 随机：每次命中从 `assets/audio/idk/` 随机取一个。
+    Random,
+}
+
+/// 已加载的打击音效集合（实时播放用）。
+pub enum SfxSet {
+    Default([Sfx; 3]),
+    Random(Vec<Sfx>),
+}
+
+impl SfxSet {
+    pub fn mode(&self) -> SfxMode {
+        match self {
+            SfxSet::Default(_) => SfxMode::Default,
+            SfxSet::Random(_) => SfxMode::Random,
+        }
+    }
+}
+
+/// `assets/audio/idk/` 下的随机打击音效资源键（按路径排序，保证播放与导出取序一致）。
+pub fn random_sfx_keys() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = crate::embedded::FILES
+        .iter()
+        .map(|(k, _)| *k)
+        .filter(|k| k.starts_with("audio/idk/"))
+        .collect();
+    v.sort_unstable();
+    v
+}
 
 /// 判定线事件共有的时间字段（单位 T）。
 trait TimeEvent {
@@ -95,8 +130,10 @@ pub fn render(renderer: &mut Renderer, chart: &Chart, runtime: &mut ChartRuntime
     // 到时的音符：播放打击音效并生成特效；随后绘制仍活动的特效
     runtime.update(chart, chart_time, w, h);
     runtime.draw_hits(renderer, chart_time, note_width);
-    // HUD：分数/连击/暂停/进度/水印
+    // HUD：分数/连击/暂停/进度（在块之下，会被块影响）
     runtime.draw_hud(renderer, chart_time);
+    // 水印：最上层（在块之上，不受块影响）
+    runtime.draw_watermark(renderer);
 
     // 同一时刻存在多个音符时使用 HL 高亮贴图
     let hl_times = highlight_times(chart);
@@ -235,8 +272,10 @@ pub struct ChartRuntime {
     /// 当前正在持续的 Hold（周期性生成打击特效）。
     active_holds: Vec<ActiveHold>,
     hits: Vec<ActiveHit>,
-    /// 打击音效：`[tap, drag, flick]`；导出模式（`--recorder`）为 `None`（不实时播放）。
-    sfx: Option<[Sfx; 3]>,
+    /// 打击音效；导出模式（`--recorder`）为 `None`（不实时播放）。
+    sfx: Option<SfxSet>,
+    /// 打击音效模式（导出时无 `sfx`，但仍需据此生成音轨）。
+    sfx_mode: SfxMode,
     /// 简易 LCG，用于生成小方块的随机方向。
     rng: u32,
     /// 总音符数（用于计分）。
@@ -251,16 +290,18 @@ pub struct ChartRuntime {
 
 impl ChartRuntime {
     /// 构建运行时：收集所有音符的打击事件（按时间排序），并接收已加载的打击音效与音乐时长。
-    pub fn new(chart: &Chart, sfx_tap: Sfx, sfx_drag: Sfx, sfx_flick: Sfx, music_len: f32) -> Self {
-        Self::build(chart, Some([sfx_tap, sfx_drag, sfx_flick]), music_len)
+    pub fn new(chart: &Chart, sfx: SfxSet, music_len: f32) -> Self {
+        let mode = sfx.mode();
+        Self::build(chart, Some(sfx), mode, music_len)
     }
 
     /// 导出模式（`--recorder`）：不实时播放打击音效（音效由 ffmpeg 与音乐混合）。
-    pub fn new_silent(chart: &Chart, music_len: f32) -> Self {
-        Self::build(chart, None, music_len)
+    /// `mode` 决定 [`Self::sfx_times`] 返回的音效索引空间。
+    pub fn new_silent(chart: &Chart, mode: SfxMode, music_len: f32) -> Self {
+        Self::build(chart, None, mode, music_len)
     }
 
-    fn build(chart: &Chart, sfx: Option<[Sfx; 3]>, music_len: f32) -> Self {
+    fn build(chart: &Chart, sfx: Option<SfxSet>, sfx_mode: SfxMode, music_len: f32) -> Self {
         let mut events = Vec::new();
         let mut holds = Vec::new();
         let mut note_count = 0usize;
@@ -303,6 +344,7 @@ impl ChartRuntime {
             active_holds: Vec::new(),
             hits: Vec::new(),
             sfx,
+            sfx_mode,
             rng: 0x1234_5678,
             note_count,
             combo: 0,
@@ -311,16 +353,49 @@ impl ChartRuntime {
         }
     }
 
-    /// 供导出混音使用：全部打击音效事件 `(谱面秒, 音效索引 0=tap / 1=drag / 2=flick)`。
+    /// 供导出混音使用：全部打击音效事件 `(谱面秒, 音效索引)`。
+    ///
+    /// - 默认模式：索引 `0=tap / 1=drag / 2=flick`（对应 `audio/*.wav`）。
+    /// - 随机模式：索引用作 `random_sfx_keys()` 的下标，每次随机取一个；
+    ///   用固定种子的 LCG 生成，保证导出可复现。
     pub fn sfx_times(&self) -> Vec<(f32, usize)> {
         let mut out: Vec<(f32, usize)> = Vec::with_capacity(self.events.len() + self.holds.len());
+        let random_n = random_sfx_keys().len();
+        let mut rng: u32 = 0x9E37_79B9;
+        let pick_random = |rng: &mut u32| -> usize {
+            *rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if random_n == 0 { 0 } else { ((*rng >> 8) as usize) % random_n }
+        };
         for e in &self.events {
-            let idx = match e.note_type { 2 => SFX_DRAG, 4 => SFX_FLICK, _ => SFX_TAP };
+            let idx = match self.sfx_mode {
+                SfxMode::Default => match e.note_type { 2 => SFX_DRAG, 4 => SFX_FLICK, _ => SFX_TAP },
+                SfxMode::Random => pick_random(&mut rng),
+            };
             out.push((e.time, idx));
         }
-        for h in &self.holds { out.push((h.time, SFX_TAP)); }
+        for h in &self.holds {
+            let idx = match self.sfx_mode {
+                SfxMode::Default => SFX_TAP,
+                SfxMode::Random => pick_random(&mut rng),
+            };
+            out.push((h.time, idx));
+        }
         out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         out
+    }
+
+    /// 播放一次打击音效：默认模式按 `default_idx`，随机模式随机取一个。
+    fn play_sfx(&mut self, default_idx: usize) {
+        if matches!(self.sfx, Some(SfxSet::Random(_))) {
+            let r = self.next_rand();
+            if let Some(SfxSet::Random(v)) = self.sfx.as_mut() {
+                if v.is_empty() { return; }
+                let i = ((r * v.len() as f32) as usize).min(v.len() - 1);
+                let _ = v[i].play(PlaySfxParams::default());
+            }
+        } else if let Some(SfxSet::Default(arr)) = self.sfx.as_mut() {
+            let _ = arr[default_idx.min(arr.len() - 1)].play(PlaySfxParams::default());
+        }
     }
 
     /// 简易 LCG 随机数（0..1）。
@@ -368,7 +443,7 @@ impl ChartRuntime {
                 4 => SFX_FLICK,
                 _ => SFX_TAP,
             };
-            if let Some(sfx) = &mut self.sfx { let _ = sfx[idx].play(PlaySfxParams::default()); }
+            self.play_sfx(idx);
             self.hit_score();
             self.cursor += 1;
         }
@@ -376,7 +451,7 @@ impl ChartRuntime {
         // Hold 头：播放一次音效，并登记其周期性打击（首次在头部时刻触发）。
         while self.hold_cursor < self.holds.len() && self.holds[self.hold_cursor].time <= chart_time {
             let event = self.holds[self.hold_cursor];
-            if let Some(sfx) = &mut self.sfx { let _ = sfx[SFX_TAP].play(PlaySfxParams::default()); }
+            self.play_sfx(SFX_TAP);
             self.active_holds.push(ActiveHold { next: event.time, event, counted: false });
             self.hold_cursor += 1;
         }
@@ -385,6 +460,12 @@ impl ChartRuntime {
         let mut i = 0;
         while i < self.active_holds.len() {
             if chart_time >= self.active_holds[i].event.end {
+                // 兜底：若因帧步长跨过 `end-0.2` 窗口（或短 Hold）导致移除时仍未计数，
+                // 在此补记一次，保证每个音符恰好贡献 1 连击/分数（上限 = 音符数）。
+                if !self.active_holds[i].counted {
+                    self.active_holds[i].counted = true;
+                    self.hit_score();
+                }
                 self.active_holds.swap_remove(i);
                 continue;
             }
@@ -478,12 +559,6 @@ impl ChartRuntime {
             );
         }
 
-        // 水印：右下角，12px（项目名 + 版本号）。
-        let watermark = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"), "all code by CHCAT1320");
-        let wm_px = 12.0 * s;
-        let wm_w = renderer.measure_text(watermark, wm_px);
-        renderer.draw_text(watermark, w / 2.0 - wm_w - 10.0 * s, -h / 2.0 + 5.0 * s, wm_px, white);
-
         // 连击：顶部居中，仅 combo > 2（数字 40px，文本 12px）。
         if self.combo > 2 {
             let combo_px = 40.0 * s;
@@ -500,6 +575,19 @@ impl ChartRuntime {
         let score_text = score_to_text(self.score);
         let sw = renderer.measure_text(&score_text, score_px);
         renderer.draw_text(&score_text, w / 2.0 - sw - 25.0 * s, h / 2.0 - 35.0 * s, score_px, white);
+    }
+
+    /// 水印：右下角，12px（项目名 + 版本号）。在 active 块**之上**绘制（`draw_text_top`），
+    /// 因此不受块效果影响。
+    fn draw_watermark(&self, renderer: &mut Renderer) {
+        let size = renderer.render_size();
+        let (w, h) = (size[0], size[1]);
+        let s = (w / 720.0).min(h / 540.0);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let watermark = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"), " all code by CHCAT1320");
+        let wm_px = 12.0 * s;
+        let wm_w = renderer.measure_text(watermark, wm_px);
+        renderer.draw_text_top(watermark, w / 2.0 - wm_w - 10.0 * s, -h / 2.0 + 5.0 * s, wm_px, white);
     }
 }
 

@@ -61,6 +61,8 @@ pub struct App {
     illustration: Option<String>,
     /// 窗口图标（内嵌 `assets/icon/icon.jpg` 解码而来）。
     icon: Option<winit::window::Icon>,
+    /// 游戏画面缩放比例（`--size`，1.0 = 铺满）。
+    render_scale: f32,
 }
 
 impl App {
@@ -72,6 +74,7 @@ impl App {
         runtime: ChartRuntime,
         illustration: Option<String>,
         icon: Option<winit::window::Icon>,
+        render_scale: Option<f32>,
     ) -> Self {
         Self {
             window: None,
@@ -82,6 +85,7 @@ impl App {
             runtime: Some(runtime),
             illustration,
             icon,
+            render_scale: render_scale.unwrap_or(1.0).max(0.01),
         }
     }
 }
@@ -125,8 +129,9 @@ impl ApplicationHandler for App {
         let runtime = self.runtime.take().unwrap();
         let running_thread = Arc::clone(&running);
         let render_window = Arc::clone(&window);
+        let render_scale = self.render_scale;
         let handle = thread::spawn(move || {
-            render_loop(renderer, chart, music, runtime, render_window, running_thread);
+            render_loop(renderer, chart, music, runtime, render_window, running_thread, render_scale);
         });
 
         self.window = Some(window);
@@ -177,10 +182,13 @@ fn render_loop(
     mut renderer: Renderer,
     chart: Chart,
     music: Music,
-    mut runtime: ChartRuntime,
+    mut     runtime: ChartRuntime,
     window: Arc<Window>,
     running: Arc<AtomicBool>,
+    render_scale: f32,
 ) {
+    // `--size` 的游戏画面缩放（之前只在导出模式生效，播放模式被丢弃）。
+    renderer.set_render_scale(render_scale);
     let mut last_report = Instant::now();
     let start = Instant::now();
     let initial = renderer.window_size();
@@ -211,6 +219,19 @@ fn render_loop(
         let shader_time = start.elapsed().as_secs_f32();
         render_block::render(&mut renderer, &chart.block_area_list, chart_time, shader_time);
         render_chart::render(&mut renderer, &chart, &mut runtime, music.position());
+
+        // `--size < 1` 时用绿色矩形标出缩放后的游戏画面区域（与导出模式一致）。
+        if render_scale < 1.0 {
+            let sc = render_scale;
+            let green = [0.30, 0.85, 0.42, 1.0];
+            let th = 4.0;
+            let tw = 2.0 * th / size[0];
+            let thh = 2.0 * th / size[1];
+            renderer.draw_rect_ndc([0.0, sc - thh / 2.0], [2.0 * sc, thh], green);
+            renderer.draw_rect_ndc([0.0, -sc + thh / 2.0], [2.0 * sc, thh], green);
+            renderer.draw_rect_ndc([-sc + tw / 2.0, 0.0], [tw, 2.0 * sc], green);
+            renderer.draw_rect_ndc([sc - tw / 2.0, 0.0], [tw, 2.0 * sc], green);
+        }
 
         // 渲染上屏
         renderer.render();
