@@ -2,6 +2,9 @@ name: Build & Draft Release
 
 on:
   push:
+    branches:
+      - master
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -88,6 +91,8 @@ jobs:
   release:
     name: Draft release
     needs: build
+    # 分支推送只做构建（CI）；仅 tag 推送或手动触发才开草稿 Release。
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
