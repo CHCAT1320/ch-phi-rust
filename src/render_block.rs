@@ -178,44 +178,78 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// 缓动表（`behavior.md` §2.1）：15 张 × 101 点，与 `GetEase.Instantiation` 一致。
+/// 缓动类型（与谱面 `easeType` 数值一一对应）。
 ///
-/// - `E[0] = u`；
-/// - `E[idx] = u^n`、`E[idx+1] = 1-(1-u)^n`，`idx ∈ {1,4,7,10}`、`n = idx/3+2`；
-/// - `E[12]` 由 `E[10]`/`E[11]` 隔点降采样折半，`50…57` 为零断点（`47…49` 在
-///   原版是构建期越界读堆垃圾，此处按公式对源索引钳制到 `100` 处理）；
-/// - `E[3/6/9/13] = 0`、`E[14] = 1`。
+/// 15 类：`0..14`。块事件里 `easeType`/`easeTypeX`/`easeTypeY` 即此值。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum EaseType {
+    Linear = 0,
+    InQuad = 1,
+    OutQuad = 2,
+    InOutQuad = 3,
+    InCubic = 4,
+    OutCubic = 5,
+    InOutCubic = 6,
+    InQuart = 7,
+    OutQuart = 8,
+    InOutQuart = 9,
+    InQuint = 10,
+    OutQuint = 11,
+    InOutQuint = 12,
+    Zero = 13,
+    One = 14,
+}
+
+/// `inOut(t, n)`：`t<0.5` 用 `2^(n-1)·t^n`，否则 `1-(−2t+2)^n/2`。
+/// `n = 2/3/4/5` 分别对应 Quad/Cubic/Quart/Quint。
+fn ease_inout(t: f32, n: i32) -> f32 {
+    if t < 0.5 {
+        (2.0f32).powi(n - 1) * t.powi(n)
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(n) / 2.0
+    }
+}
+
+/// 缓动表：15 张 × 101 点，索引即 [`EaseType`]。
+///
+/// - `Linear` = `u`；
+/// - `InQuad/InCubic/InQuart/InQuint` = `u^n`、其 `Out*` 后继 = `1-(1-u)^n`；
+/// - `InOutQuad/InOutCubic/InOutQuart/InOutQuint` = 真实 inOut（见 [`ease_inout`]）；
+/// - `Zero` 恒 0、`One` 恒 1（`One` 等价于瞬间跳到终点）。
 fn ease_tables() -> &'static [[f32; 101]; 15] {
     static TABLES: OnceLock<[[f32; 101]; 15]> = OnceLock::new();
     TABLES.get_or_init(|| {
         let mut t = [[0.0f32; 101]; 15];
         for i in 0..=100 {
-            t[0][i] = i as f32 / 100.0;
+            t[EaseType::Linear as usize][i] = i as f32 / 100.0;
         }
-        for idx in [1usize, 4, 7, 10] {
-            let n = (idx / 3 + 2) as i32;
+        // In/Out 对：指数 n 由基类型决定（Quad=2、Cubic=3、Quart=4、Quint=5）。
+        for (in_ty, out_ty, n) in [
+            (EaseType::InQuad, EaseType::OutQuad, 2i32),
+            (EaseType::InCubic, EaseType::OutCubic, 3),
+            (EaseType::InQuart, EaseType::OutQuart, 4),
+            (EaseType::InQuint, EaseType::OutQuint, 5),
+        ] {
             for i in 0..=100 {
                 let u = i as f32 / 100.0;
-                t[idx][i] = u.powi(n);
-                t[idx + 1][i] = 1.0 - (1.0 - u).powi(n);
+                t[in_ty as usize][i] = u.powi(n);
+                t[out_ty as usize][i] = 1.0 - (1.0 - u).powi(n);
             }
         }
-        for j in 0..=49usize {
-            let k = (8 + 2 * j).min(100);
-            t[12][j] = t[10][k] * 0.5;
-            if 58 + j <= 100 {
-                t[12][58 + j] = t[11][k] * 0.5 + 0.5;
+        // InOut 系列：真实 inOut 曲线。
+        for (ty, n) in [
+            (EaseType::InOutQuad, 2i32),
+            (EaseType::InOutCubic, 3),
+            (EaseType::InOutQuart, 4),
+            (EaseType::InOutQuint, 5),
+        ] {
+            for i in 0..=100 {
+                t[ty as usize][i] = ease_inout(i as f32 / 100.0, n);
             }
         }
-        t[12][100] = 1.0;
-        // 死表显式补零：`3/6/9/13` 从未被主循环写入（原版 `new float[101]` 零初始化），
-        // 进度恒为 0 → 事件永远停在起点。这里显式写出以免依赖"未写入"的隐式行为。
-        t[3] = [0.0; 101];
-        t[6] = [0.0; 101];
-        t[9] = [0.0; 101];
-        t[13] = [0.0; 101];
-        // `14` 恒 1：等价于瞬间跳到终点。
-        t[14] = [1.0; 101];
+        t[EaseType::Zero as usize] = [0.0; 101];
+        t[EaseType::One as usize] = [1.0; 101];
         t
     })
 }
@@ -425,14 +459,18 @@ mod ease_tests {
                 ty, vals[0], vals[1], vals[2], vals[3], vals[4],
             );
         }
-        // 死表必须恒 0；14 恒 1。
-        for ty in [3, 6, 9, 13] {
-            for u in us {
-                assert_eq!(ease(ty, u), 0.0, "type {ty} 应恒为 0");
-            }
+        // `13` 恒 0；`14` 恒 1。
+        for u in us {
+            assert_eq!(ease(13, u), 0.0, "type 13 应恒为 0");
         }
         for u in us {
             assert_eq!(ease(14, u), 1.0, "type 14 应恒为 1");
+        }
+        // `3/6/9/12` 为 inOut 系列：`u=0` 处 0、`u=1` 处 1、`u=0.5` 处 0.5。
+        for ty in [3, 6, 9, 12] {
+            assert_eq!(ease(ty, 0.0), 0.0, "type {ty} 起点应为 0");
+            assert_eq!(ease(ty, 1.0), 1.0, "type {ty} 终点应为 1");
+            assert!((ease(ty, 0.5) - 0.5).abs() < 1e-6, "type {ty} 中点应为 0.5");
         }
         // 缓动表边界：i>=100 / i<0 / NaN 钳制。
         assert_eq!(ease(0, 2.0), 1.0);
@@ -440,31 +478,23 @@ mod ease_tests {
         assert_eq!(ease(0, f32::NAN), 0.0);
     }
 
-    /// CHCAT 风格的「真实 inOut」缓动（用于对照，非原版行为）。
-    fn inout(t: f32, n: i32) -> f32 {
-        if t < 0.5 {
-            (2.0f32).powi(n - 1) * t.powi(n)
-        } else {
-            1.0 - (-2.0 * t + 2.0).powi(n) / 2.0
-        }
-    }
-
-    /// 对照 dump：`3/6/9/12` 的「原版死表/降采样」 vs 「CHCAT 真实 inOut」。
+    /// 对照 dump：`3/6/9/12` 与 `ease_inout` 逐点一致性。
     /// `cargo test -p ch-phi-rust ease_compare -- --nocapture`
     #[test]
     fn ease_compare() {
         let us = [0.0f32, 0.25, 0.5, 0.75, 1.0];
-        let chcat = [(3i32, 2i32), (6, 3), (9, 4), (12, 5)]; // (type, inOut 指数)
-        println!("type |       原版 (死表/降采样)        |        CHCAT 真实 inOut");
-        for (ty, n) in chcat {
-            let orig: Vec<f32> = us.iter().map(|&u| ease(ty, u)).collect();
-            let real: Vec<f32> = us.iter().map(|&u| inout(u, n)).collect();
+        for (ty, n) in [(3i32, 2i32), (6, 3), (9, 4), (12, 5)] {
+            let vals: Vec<f32> = us.iter().map(|&u| ease(ty, u)).collect();
+            let real: Vec<f32> = us.iter().map(|&u| ease_inout(u, n)).collect();
             println!(
-                " {:>2}  | {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} | {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
+                "type {:>2}: 表 {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} | inOut {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
                 ty,
-                orig[0], orig[1], orig[2], orig[3], orig[4],
+                vals[0], vals[1], vals[2], vals[3], vals[4],
                 real[0], real[1], real[2], real[3], real[4],
             );
+            for (a, b) in vals.iter().zip(real.iter()) {
+                assert!((a - b).abs() < 1e-6, "type {ty} 表与 ease_inout 应一致");
+            }
         }
     }
 }
