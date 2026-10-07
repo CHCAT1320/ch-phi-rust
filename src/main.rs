@@ -12,7 +12,70 @@
 //! - [`fps`]：帧率统计
 
 // 发布版作为纯 GUI 程序（无控制台窗口），任务栏才会使用窗口自身的大图标。
+// 若从终端启动（存在父控制台），`windows_console::ensure_output()` 会把 stdout/stderr 接回该终端，
+// 因此 release 下仍能看到全部输出；双击启动则静默（无控制台），不弹黑框。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+/// Windows 控制台输出：GUI 子系统（release）默认无控制台，导致 `println!`/`eprintln!` 无处可去。
+/// 这里在启动时尝试挂回**父进程的控制台**（从终端启动时存在），使所有构建都有输出。
+#[cfg(windows)]
+mod windows_console {
+    use std::os::windows::io::FromRawHandle;
+
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+        fn SetConsoleOutputCP(w_code_page_id: u32) -> i32;
+    }
+
+    /// 若进程无控制台且存在父控制台，则挂接并把 stdout/stderr 指向它；随后把控制台代码页设为 UTF-8。
+    /// 无父控制台（如双击）时静默返回，保持纯 GUI 行为。
+    pub fn ensure_output() {
+        unsafe {
+            // 已连接到终端（例如 debug 或从管道启动）时无需处理。
+            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+                return;
+            }
+            // 让中文输出在控制台正确显示。
+            SetConsoleOutputCP(65001);
+            for (std_handle, fd) in [(STD_OUTPUT_HANDLE, 1), (STD_ERROR_HANDLE, 2)] {
+                let h = GetStdHandle(std_handle);
+                if h.is_null() || h as isize == -1 {
+                    continue;
+                }
+                // 用 CRT 的 `_open_osfhandle` + `_dup2` 把该句柄绑定到 fd 1/2，
+                // 使 Rust 的 `std::io::stdout()/stderr()` 真正写到父控制台。
+                let osfd = _open_osfhandle(h as isize, 0);
+                if osfd != -1 {
+                    let _ = _dup2(osfd, fd);
+                }
+            }
+        }
+    }
+
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+        fn _dup2(fd1: i32, fd2: i32) -> i32;
+    }
+
+    /// 保留：便于将来用 `File::from_raw_handle` 直接构造句柄（当前未使用）。
+    #[allow(dead_code)]
+    fn _raw_handle_roundtrip(h: *mut core::ffi::c_void) -> std::fs::File {
+        unsafe { std::fs::File::from_raw_handle(h) }
+    }
+}
+
+/// 非 Windows 平台无操作。
+#[cfg(not(windows))]
+mod windows_console {
+    pub fn ensure_output() {}
+}
 
 mod app;
 mod chart_fv;
@@ -259,6 +322,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 }
 
 fn main() {
+    // 必须在任何输出之前调用：release 下把 stdout/stderr 接回父终端控制台（若存在）。
+    windows_console::ensure_output();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut opts = parse_args(&args).unwrap_or_else(|e| {
         eprintln!("参数错误：{e}");

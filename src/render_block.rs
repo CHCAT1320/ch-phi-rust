@@ -138,7 +138,12 @@ fn safe_div(numerator: f32, denominator: f32) -> f32 {
     }
 }
 
-/// 当前事件索引：最后一个 `time <= now` 的事件（相等时取靠后），范围 `[-1, Count-2]`。
+/// `FindCurrentEventIndex<T>`（VA `0x1F9A2DC`）：返回最后一个 `time <= now` 的事件，
+/// 索引范围 `[-1, Count-2]`（`-1` = 早于首事件；`Count-2` = 最后一个事件对）。
+///
+/// - `now` 语义为 `progressControl.nowTime`（本帧固定值，C# 在循环体内重读同一帧值，等价）；
+/// - 时间戳重复时**选最靠后的那个**（用 `t > now` 严格大于，相等则继续前进）；
+/// - 从头线性扫描，无二分。
 fn find_current<T>(events: &[T], now: f32, time: impl Fn(&T) -> f32) -> i32 {
     if events.is_empty() {
         return -1;
@@ -156,7 +161,11 @@ fn find_current<T>(events: &[T], now: f32, time: impl Fn(&T) -> f32) -> i32 {
     }
 }
 
-/// 缓动进度 `(now - cur) / (next - cur)`（相邻事件时间相等时取 1 以避免 NaN）。
+/// `CalculateEasedProgress(cur, next, ...)` 的裸除法 `(now - cur) / (next - cur)`。
+///
+/// `behavior.md` §2.3：原版 `CalculateEasedProgress` **无除零保护**，相邻事件时间相等时
+/// 进度为 `±Inf`/`NaN`，并要求「复现时应显式处理这一情形（例如相等时直接取 `next` 的值）」。
+/// 这里相等时返回 `1.0`，经 `ease(1.0)` 与 `lerp` 后恰好取到 `next` 的值，即文档建议的退化行为。
 fn progress(now: f32, cur: f32, next: f32) -> f32 {
     if next > cur {
         (now - cur) / (next - cur)
@@ -207,6 +216,15 @@ fn ease_tables() -> &'static [[f32; 101]; 15] {
 }
 
 /// `GetEase.GetEaseWithProgress`（VA `0x1CAE190`）：查表 + 线性插值。
+///
+/// 对齐 `behavior.md` §2.2：
+/// - `NaN`：原版经 ARM64 饱和转换 + `csel` 得到 `INT_MIN`（符号位为 1）→ 命中 `i < 0` 分支返回
+///   `table[0]`；此处直接返回 `table[0]`，等价且安全；
+/// - `i >= 100` → `table[100]`，`i < 0` → `table[0]`；
+/// - 否则 `b + f * (a - b)`（即 `Mathf.Lerp(table[i], table[i+1], f)`）。
+///
+/// `ease_type` 越界：原版两个入口都先 `EaseInfos.Count > type`，越界直接抛
+/// `IndexOutOfRangeException`。此处 clamp 到 `[0,14]` 以避免 panic（安全偏离，谱面正常值均在内）。
 fn ease(ease_type: i32, progress: f32) -> f32 {
     let tables = ease_tables();
     let table = &tables[ease_type.clamp(0, 14) as usize];
@@ -228,6 +246,14 @@ fn ease(ease_type: i32, progress: f32) -> f32 {
 }
 
 /// `UpdateScale`：返回 `(size, center)`。
+///
+/// 结构对齐 `decompiled.cs` 的 `UpdateScale`：
+/// 1) 对 `index` 之前的每个事件，用 `SafeDiv(e[i+1].scale, e[i].scale)` 绕 `e[i].anchor` 缩放 `center`；
+/// 2) `index >= Count-1` 时 `size = ev[index].scale * originalSize`，否则用当前事件的双轴插值比例
+///    再绕 `cur.anchor` 缩放一次，`size = interp * originalSize`。
+///
+/// `index == -1`（`now` 早于首事件）：`behavior.md` §2.3 指出原版此处会越界读取（`Count==1`），
+/// 并要求「复现时应显式处理」。这里显式回退到原始几何，属文档认可的降级，而非原版越界行为。
 fn update_scale(
     block: &BlockArea,
     now: f32,
@@ -240,11 +266,13 @@ fn update_scale(
         return (original_size, base_center);
     }
     let index = find_current(ev, now, |e: &BlockScaleEvent| e.time);
+    // 显式处理 `index == -1`（文档 §2.3 要求的单元素越界情形），返回原始几何。
     if index == -1 {
         return (original_size, base_center);
     }
 
     let mut p = base_center;
+    // 历史事件累积：不加 `Clamp`（原版 `UpdateScale` 的历史循环不做 `Clamp01`）。
     for i in 0..index as usize {
         let (e0, e1) = (&ev[i], &ev[i + 1]);
         let a = anchor_to_world(e0.anchor, screen);
@@ -261,11 +289,10 @@ fn update_scale(
         ([s.x * original_size[0], s.y * original_size[1]], p)
     } else {
         let (cur, next) = (&ev[index as usize], &ev[index as usize + 1]);
-        let tx = ease(cur.ease_type_x, progress(now, cur.time, next.time)).clamp(0.0, 1.0);
-        let ty = ease(cur.ease_type_y, progress(now, cur.time, next.time)).clamp(0.0, 1.0);
+        let t = progress(now, cur.time, next.time);
         let interp = [
-            lerp(cur.scale.x, next.scale.x, tx),
-            lerp(cur.scale.y, next.scale.y, ty),
+            lerp(cur.scale.x, next.scale.x, ease(cur.ease_type_x, t).clamp(0.0, 1.0)),
+            lerp(cur.scale.y, next.scale.y, ease(cur.ease_type_y, t).clamp(0.0, 1.0)),
         ];
         let a = anchor_to_world(cur.anchor, screen);
         p = scale_around(
@@ -282,6 +309,12 @@ fn update_scale(
 }
 
 /// `UpdateRotation`：返回 `(角度, center)`。
+///
+/// 结构对齐 `decompiled.cs` 的 `UpdateRotation`：对 `index` 之前的每个事件累积
+/// `e[i+1].rotation - e[i].rotation`（绕 `e[i].anchor`），再叠加当前事件（插值）的 `Δrotation`。
+/// `rotation` 为**绝对角**（直接赋给 `eulerAngles.z`）。
+///
+/// `index == -1`：同 [`update_scale`]，文档 §2.3 要求显式处理，这里回退到 `(0, center)`。
 fn update_rotation(
     block: &BlockArea,
     now: f32,
@@ -293,11 +326,13 @@ fn update_rotation(
         return (0.0, center);
     }
     let index = find_current(ev, now, |e: &BlockRotateEvent| e.time);
+    // 显式处理 `index == -1`（文档 §2.3）。
     if index == -1 {
         return (0.0, center);
     }
 
     let mut p = center;
+    // 历史事件累积：不加 `Clamp`（原版历史循环不做 `Clamp01`）。
     for i in 0..index as usize {
         let (e0, e1) = (&ev[i], &ev[i + 1]);
         let a = anchor_to_world(e0.anchor, screen);
@@ -317,6 +352,9 @@ fn update_rotation(
 }
 
 /// `UpdateMovement`：返回移动后的 `center`。
+///
+/// 对齐 `decompiled.cs`：`center += InterpolateMoveEvent(index) - originalCenter`，
+/// `index == -1` 时（`i != -1` 守卫，原版 `UpdateMovement` **有**该守卫）原样返回 `center`。
 fn update_movement(
     block: &BlockArea,
     now: f32,
@@ -341,6 +379,13 @@ fn update_movement(
 }
 
 /// 插值移动事件目标位置（像素）。
+///
+/// 对齐 `decompiled.cs` 的 `InterpolateMoveEvent`：`index >= Count-1` 时直接返回
+/// `AnchorToWorld(ev[index].endPosition)`；否则用 `easeTypeX`/`easeTypeY` 分别求双轴进度，
+/// 插值 `endPosition` 后转世界坐标。
+///
+/// `behavior.md` §2.3：正常路径下 `index` 最大为 `Count-2`，`next` 始终存在；时间越过最后一个
+/// 事件后进度 `p > 1` 由 `Clamp01` 收敛到 `1`，输出恰好等于 `events[Count-1]`——不是跳过插值。
 fn interpolate_move(
     ev: &[BlockMoveEvent],
     index: usize,
@@ -351,11 +396,10 @@ fn interpolate_move(
         return anchor_to_world(ev[index].end_position, screen);
     }
     let (cur, next) = (&ev[index], &ev[index + 1]);
-    let tx = ease(cur.ease_type_x, progress(now, cur.time, next.time)).clamp(0.0, 1.0);
-    let ty = ease(cur.ease_type_y, progress(now, cur.time, next.time)).clamp(0.0, 1.0);
+    let t = progress(now, cur.time, next.time);
     let v = Point {
-        x: lerp(cur.end_position.x, next.end_position.x, tx),
-        y: lerp(cur.end_position.y, next.end_position.y, ty),
+        x: lerp(cur.end_position.x, next.end_position.x, ease(cur.ease_type_x, t).clamp(0.0, 1.0)),
+        y: lerp(cur.end_position.y, next.end_position.y, ease(cur.ease_type_y, t).clamp(0.0, 1.0)),
     };
     anchor_to_world(v, screen)
 }
