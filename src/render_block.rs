@@ -208,9 +208,14 @@ fn ease_tables() -> &'static [[f32; 101]; 15] {
             }
         }
         t[12][100] = 1.0;
-        for i in 0..=100 {
-            t[14][i] = 1.0;
-        }
+        // 死表显式补零：`3/6/9/13` 从未被主循环写入（原版 `new float[101]` 零初始化），
+        // 进度恒为 0 → 事件永远停在起点。这里显式写出以免依赖"未写入"的隐式行为。
+        t[3] = [0.0; 101];
+        t[6] = [0.0; 101];
+        t[9] = [0.0; 101];
+        t[13] = [0.0; 101];
+        // `14` 恒 1：等价于瞬间跳到终点。
+        t[14] = [1.0; 101];
         t
     })
 }
@@ -402,4 +407,64 @@ fn interpolate_move(
         y: lerp(cur.end_position.y, next.end_position.y, ease(cur.ease_type_y, t).clamp(0.0, 1.0)),
     };
     anchor_to_world(v, screen)
+}
+
+#[cfg(test)]
+mod ease_tests {
+    use super::*;
+
+    /// 打印 15 张缓动表在 `u = 0 / 0.25 / 0.5 / 0.75 / 1` 的采样值，
+    /// 与 `behavior.md` §2.1 对照表核对（`cargo test -p ch-phi-rust ease_dump -- --nocapture`）。
+    #[test]
+    fn ease_dump() {
+        let us = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+        for ty in 0..15i32 {
+            let vals: Vec<f32> = us.iter().map(|&u| ease(ty, u)).collect();
+            println!(
+                "type {:>2}: {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4}",
+                ty, vals[0], vals[1], vals[2], vals[3], vals[4],
+            );
+        }
+        // 死表必须恒 0；14 恒 1。
+        for ty in [3, 6, 9, 13] {
+            for u in us {
+                assert_eq!(ease(ty, u), 0.0, "type {ty} 应恒为 0");
+            }
+        }
+        for u in us {
+            assert_eq!(ease(14, u), 1.0, "type 14 应恒为 1");
+        }
+        // 缓动表边界：i>=100 / i<0 / NaN 钳制。
+        assert_eq!(ease(0, 2.0), 1.0);
+        assert_eq!(ease(0, -1.0), 0.0);
+        assert_eq!(ease(0, f32::NAN), 0.0);
+    }
+
+    /// CHCAT 风格的「真实 inOut」缓动（用于对照，非原版行为）。
+    fn inout(t: f32, n: i32) -> f32 {
+        if t < 0.5 {
+            (2.0f32).powi(n - 1) * t.powi(n)
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(n) / 2.0
+        }
+    }
+
+    /// 对照 dump：`3/6/9/12` 的「原版死表/降采样」 vs 「CHCAT 真实 inOut」。
+    /// `cargo test -p ch-phi-rust ease_compare -- --nocapture`
+    #[test]
+    fn ease_compare() {
+        let us = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+        let chcat = [(3i32, 2i32), (6, 3), (9, 4), (12, 5)]; // (type, inOut 指数)
+        println!("type |       原版 (死表/降采样)        |        CHCAT 真实 inOut");
+        for (ty, n) in chcat {
+            let orig: Vec<f32> = us.iter().map(|&u| ease(ty, u)).collect();
+            let real: Vec<f32> = us.iter().map(|&u| inout(u, n)).collect();
+            println!(
+                " {:>2}  | {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} | {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
+                ty,
+                orig[0], orig[1], orig[2], orig[3], orig[4],
+                real[0], real[1], real[2], real[3], real[4],
+            );
+        }
+    }
 }
