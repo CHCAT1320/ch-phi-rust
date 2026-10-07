@@ -91,7 +91,7 @@ assets/charts/<曲名>/
 └─ Info.json                                                         # 曲目信息，可选
 ```
 
-谱面为 RPE 风格：顶层 `formatVersion` / `offset`，含 `judgeLineList`（判定线与音符、
+顶层 `formatVersion` / `offset`，含 `judgeLineList`（判定线与音符、
 速度/位移/旋转等事件）与 `blockAreaList`（方块区域及缩放/旋转/移动事件）。
 
 ## 目录结构（源码）
